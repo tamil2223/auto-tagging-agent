@@ -113,7 +113,19 @@ class LLMClassifier:
 
 
 def _build_provider_chain_from_env() -> list[ProviderConfig]:
-    """Builds provider order from available API keys."""
+    """Builds provider order from available API keys.
+
+    Live provider calls are intentionally opt-in to keep local dev/tests deterministic.
+    Set `LLM_ENABLE_LIVE_CALLS=true` to enable real provider chaining.
+    """
+    if os.getenv("LLM_ENABLE_LIVE_CALLS", "false").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return []
+
     chain: list[ProviderConfig] = []
     if os.getenv("GOOGLE_API_KEY"):
         chain.append(ProviderConfig(name="gemini", model=os.getenv("GEMINI_MODEL", "gemini/gemini-2.0-flash")))
