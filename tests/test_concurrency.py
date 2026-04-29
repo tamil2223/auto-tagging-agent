@@ -25,8 +25,9 @@ def test_parallel_same_idempotency_key_is_processed_once() -> None:
         "idempotency_key": f"idem_parallel_{tx_suffix}",
     }
 
+    headers = {"X-API-Key": "demo_key_tenant_a"}
     with TestClient(app) as client:
-        before_count = len(client.get(f"/audit-log/{tenant_id}").json())
+        before_count = len(client.get(f"/audit-log/{tenant_id}", headers=headers).json())
 
     barrier = threading.Barrier(8)
 
@@ -34,7 +35,7 @@ def test_parallel_same_idempotency_key_is_processed_once() -> None:
         """Sends one request after all workers reach the same starting point."""
         barrier.wait()
         with TestClient(app) as local_client:
-            response = local_client.post("/transactions/tag", json=payload)
+            response = local_client.post("/transactions/tag", json=payload, headers=headers)
             return response.status_code, response.json()
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -49,6 +50,6 @@ def test_parallel_same_idempotency_key_is_processed_once() -> None:
     assert first_body["status"] == "UNKNOWN"
 
     with TestClient(app) as client:
-        after_count = len(client.get(f"/audit-log/{tenant_id}").json())
+        after_count = len(client.get(f"/audit-log/{tenant_id}", headers=headers).json())
 
     assert after_count == before_count + 1

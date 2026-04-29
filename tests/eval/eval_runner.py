@@ -44,6 +44,12 @@ def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float]:
     brier_sum = 0.0
     brier_count = 0
 
+    tenant_headers = {
+        "tenant_a": {"X-API-Key": "demo_key_tenant_a"},
+        "tenant_b": {"X-API-Key": "demo_key_tenant_b"},
+    }
+    headers = tenant_headers.get(tenant_id, {})
+
     run_id = uuid4().hex[:8]
     with TestClient(app) as client:
         for index, item in enumerate(fixtures):
@@ -58,7 +64,7 @@ def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float]:
                 "ocr_text": None,
                 "idempotency_key": f"eval_{run_id}_{index}",
             }
-            response = client.post("/transactions/tag", json=payload)
+            response = client.post("/transactions/tag", json=payload, headers=headers)
             result = response.json()
             status = result["status"]
             source = result["source"]

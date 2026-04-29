@@ -38,6 +38,7 @@ def run_demo_scenario() -> list[str]:
     lines: list[str] = []
 
     with TestClient(app) as client:
+        headers = {"X-API-Key": "demo_key_tenant_a"}
         tx101 = {
             "tx_id": f"tx101_{run_id}",
             "tenant_id": "tenant_a",
@@ -49,7 +50,7 @@ def run_demo_scenario() -> list[str]:
             "ocr_text": None,
             "idempotency_key": f"idem101_{run_id}",
         }
-        res101 = client.post("/transactions/tag", json=tx101).json()
+        res101 = client.post("/transactions/tag", json=tx101, headers=headers).json()
         lines.append(_format_line(res101, "zoom-us"))
 
         tx102 = {
@@ -63,7 +64,7 @@ def run_demo_scenario() -> list[str]:
             "ocr_text": None,
             "idempotency_key": f"idem102_{run_id}",
         }
-        res102 = client.post("/transactions/tag", json=tx102).json()
+        res102 = client.post("/transactions/tag", json=tx102, headers=headers).json()
         lines.append(_format_line(res102, vendor_repeat))
 
         resolve = client.post(
@@ -73,6 +74,7 @@ def run_demo_scenario() -> list[str]:
                 "action": "correct",
                 "final_coa_account_id": "6100",
             },
+            headers=headers,
         ).json()
         lines.append(
             f"[Audit] tx={tx102['tx_id']} reviewer_override "
@@ -90,7 +92,7 @@ def run_demo_scenario() -> list[str]:
             "ocr_text": None,
             "idempotency_key": f"idem103_{run_id}",
         }
-        res103 = client.post("/transactions/tag", json=tx103).json()
+        res103 = client.post("/transactions/tag", json=tx103, headers=headers).json()
         lines.append(_format_line(res103, vendor_repeat))
 
         tx104 = {
@@ -104,7 +106,7 @@ def run_demo_scenario() -> list[str]:
             "ocr_text": None,
             "idempotency_key": f"idem104_{run_id}",
         }
-        res104 = client.post("/transactions/tag", json=tx104).json()
+        res104 = client.post("/transactions/tag", json=tx104, headers=headers).json()
         lines.append(_format_line(res104, "unknown-vendor"))
 
     return lines

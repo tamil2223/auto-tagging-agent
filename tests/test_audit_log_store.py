@@ -8,7 +8,8 @@ from app.store.audit_log import AuditLogStore
 
 
 def test_audit_log_store_persists_records_to_disk(tmp_path: Path) -> None:
-    store = AuditLogStore(tmp_path)
+    db_path = tmp_path / "state.db"
+    store = AuditLogStore(db_path)
     item = TaggingResult(
         tx_id="tx_901",
         tenant_id="tenant_a",
@@ -22,7 +23,7 @@ def test_audit_log_store_persists_records_to_disk(tmp_path: Path) -> None:
     )
     store.append(item)
 
-    reloaded = AuditLogStore(tmp_path)
+    reloaded = AuditLogStore(db_path)
     values = reloaded.list_by_tenant("tenant_a")
 
     assert len(values) == 1

@@ -1,69 +1,70 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from pathlib import Path
+import sqlite3
 import threading
 
 from app.models import TaggingResult
 
 
 class AuditLogStore:
-    """Persists append-only audit records per tenant."""
+    """Persists append-only audit records in SQLite."""
 
-    def __init__(self, root_dir: Path) -> None:
-        """Initializes the audit store and loads existing files.
+    def __init__(self, db_path: Path) -> None:
+        """Initializes the audit store and creates table if needed.
 
         Args:
-            root_dir: Base directory for tenant audit JSONL files.
+            db_path: SQLite file path for shared runtime state.
         """
-        self._root_dir = root_dir
-        self._root_dir.mkdir(parents=True, exist_ok=True)
+        self._db_path = db_path
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._items: dict[str, list[TaggingResult]] = defaultdict(list)
-        self._load_existing_files()
+        self._init_db()
 
-    def _load_existing_files(self) -> None:
-        """Loads tenant audit events from disk into memory."""
-        for file_path in self._root_dir.glob("*.jsonl"):
-            tenant_id = file_path.stem
-            for line in file_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                self._items[tenant_id].append(TaggingResult(**json.loads(line)))
-
-    def _tenant_file(self, tenant_id: str) -> Path:
-        """Builds a tenant-specific audit file path.
-
-        Args:
-            tenant_id: Tenant identifier.
-
-        Returns:
-            Path to tenant audit jsonl file.
-        """
-        return self._root_dir / f"{tenant_id}.jsonl"
+    def _init_db(self) -> None:
+        """Creates audit table schema."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_id ON audit_log(tenant_id)"
+            )
 
     def append(self, result: TaggingResult) -> None:
-        """Appends a single immutable audit event.
+        """Appends a single immutable audit event to SQLite.
 
         Args:
             result: Tagging result event to append.
         """
         with self._lock:
-            self._items[result.tenant_id].append(result)
-            file_path = self._tenant_file(result.tenant_id)
-            line = json.dumps(result.model_dump(mode="json"), ensure_ascii=True)
-            with file_path.open("a", encoding="utf-8") as handle:
-                handle.write(f"{line}\n")
+            payload = json.dumps(result.model_dump(mode="json"), ensure_ascii=True)
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "INSERT INTO audit_log (tenant_id, payload_json) VALUES (?, ?)",
+                    (result.tenant_id, payload),
+                )
 
     def list_by_tenant(self, tenant_id: str) -> list[TaggingResult]:
-        """Returns audit events for one tenant.
+        """Returns audit events for one tenant from SQLite.
 
         Args:
             tenant_id: Tenant identifier.
 
         Returns:
-            A copy of stored tenant audit events.
+            Tenant audit events in insertion order.
         """
         with self._lock:
-            return list(self._items.get(tenant_id, []))
+            with sqlite3.connect(self._db_path) as conn:
+                rows = conn.execute(
+                    "SELECT payload_json FROM audit_log WHERE tenant_id = ? ORDER BY id ASC",
+                    (tenant_id,),
+                ).fetchall()
+            return [TaggingResult(**json.loads(row[0])) for row in rows]

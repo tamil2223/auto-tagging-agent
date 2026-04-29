@@ -3,56 +3,39 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+import sqlite3
 
 from app.models import TaggingResult
 
 
 class IdempotencyStore:
-    """Persists idempotency records per tenant on local disk."""
+    """Persists idempotency records in SQLite."""
 
-    def __init__(self, root_dir: Path) -> None:
-        """Initializes file-backed idempotency storage.
+    def __init__(self, db_path: Path) -> None:
+        """Initializes SQLite-backed idempotency storage.
 
         Args:
-            root_dir: Base directory where tenant cache files are stored.
+            db_path: SQLite file path for shared runtime state.
         """
-        self._root_dir = root_dir
-        self._root_dir.mkdir(parents=True, exist_ok=True)
+        self._db_path = db_path
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._cache: dict[str, dict[str, tuple[str, TaggingResult]]] = {}
+        self._init_db()
 
-    def _tenant_file(self, tenant_id: str) -> Path:
-        """Returns the cache file path for one tenant.
-
-        Args:
-            tenant_id: Tenant identifier.
-
-        Returns:
-            Tenant-specific JSON cache path.
-        """
-        return self._root_dir / f"{tenant_id}.json"
-
-    def _load_tenant(self, tenant_id: str) -> None:
-        """Loads a tenant cache from disk into memory if not already loaded.
-
-        Args:
-            tenant_id: Tenant identifier.
-        """
-        if tenant_id in self._cache:
-            return
-
-        file_path = self._tenant_file(tenant_id)
-        if not file_path.exists():
-            self._cache[tenant_id] = {}
-            return
-
-        payload = json.loads(file_path.read_text(encoding="utf-8"))
-        tenant_cache: dict[str, tuple[str, TaggingResult]] = {}
-        for idempotency_key, value in payload.items():
-            fingerprint = value["fingerprint"]
-            result = TaggingResult(**value["result"])
-            tenant_cache[idempotency_key] = (fingerprint, result)
-        self._cache[tenant_id] = tenant_cache
+    def _init_db(self) -> None:
+        """Creates idempotency table schema."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency (
+                    tenant_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, idempotency_key)
+                )
+                """
+            )
 
     def get(self, tenant_id: str, idempotency_key: str) -> tuple[str, TaggingResult] | None:
         """Reads a previously persisted idempotency result if present.
@@ -65,8 +48,18 @@ class IdempotencyStore:
             Fingerprint and cached result when present, otherwise None.
         """
         with self._lock:
-            self._load_tenant(tenant_id)
-            return self._cache[tenant_id].get(idempotency_key)
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT fingerprint, result_json
+                    FROM idempotency
+                    WHERE tenant_id = ? AND idempotency_key = ?
+                    """,
+                    (tenant_id, idempotency_key),
+                ).fetchone()
+            if row is None:
+                return None
+            return row[0], TaggingResult(**json.loads(row[1]))
 
     def put(
         self,
@@ -84,13 +77,16 @@ class IdempotencyStore:
             result: Final tagging result to return for retries.
         """
         with self._lock:
-            self._load_tenant(tenant_id)
-            self._cache[tenant_id][idempotency_key] = (fingerprint, result)
-            payload = {
-                key: {"fingerprint": value[0], "result": value[1].model_dump(mode="json")}
-                for key, value in self._cache[tenant_id].items()
-            }
-            self._tenant_file(tenant_id).write_text(
-                json.dumps(payload, ensure_ascii=True, indent=2),
-                encoding="utf-8",
-            )
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO idempotency (tenant_id, idempotency_key, fingerprint, result_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        tenant_id,
+                        idempotency_key,
+                        fingerprint,
+                        json.dumps(result.model_dump(mode="json"), ensure_ascii=True),
+                    ),
+                )

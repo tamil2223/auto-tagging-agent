@@ -13,6 +13,12 @@ def _unique_key(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
+def _headers(tenant_id: str) -> dict[str, str]:
+    if tenant_id == "tenant_a":
+        return {"X-API-Key": "demo_key_tenant_a"}
+    return {"X-API-Key": "demo_key_tenant_b"}
+
+
 def test_health_endpoint_returns_ok() -> None:
     client = TestClient(app)
     response = client.get("/health")
@@ -35,7 +41,7 @@ def test_tag_endpoint_rule_match_auto_tags() -> None:
         "idempotency_key": _unique_key("idem_001"),
     }
 
-    response = client.post("/transactions/tag", json=payload)
+    response = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     assert response.status_code == 200
     data = response.json()
@@ -59,7 +65,7 @@ def test_tag_endpoint_no_rule_routes_to_unknown() -> None:
         "idempotency_key": _unique_key("idem_002"),
     }
 
-    response = client.post("/transactions/tag", json=payload)
+    response = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     assert response.status_code == 200
     data = response.json()
@@ -82,8 +88,8 @@ def test_idempotency_returns_cached_result_for_same_payload() -> None:
         "idempotency_key": _unique_key("idem_003"),
     }
 
-    first = client.post("/transactions/tag", json=payload)
-    second = client.post("/transactions/tag", json=payload)
+    first = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
+    second = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -105,8 +111,8 @@ def test_idempotency_key_conflict_when_payload_differs() -> None:
     }
     payload_b = {**payload_a, "amount": "42.00"}
 
-    first = client.post("/transactions/tag", json=payload_a)
-    second = client.post("/transactions/tag", json=payload_b)
+    first = client.post("/transactions/tag", json=payload_a, headers=_headers("tenant_a"))
+    second = client.post("/transactions/tag", json=payload_b, headers=_headers("tenant_a"))
 
     assert first.status_code == 200
     assert second.status_code == 409
@@ -126,7 +132,7 @@ def test_tag_endpoint_llm_path_auto_tags_when_confidence_is_high() -> None:
         "idempotency_key": _unique_key("idem_005"),
     }
 
-    response = client.post("/transactions/tag", json=payload)
+    response = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     assert response.status_code == 200
     data = response.json()
@@ -151,8 +157,8 @@ def test_tag_endpoint_llm_path_routes_to_review_queue_when_confidence_is_medium(
         "idempotency_key": _unique_key("idem_006"),
     }
 
-    response = client.post("/transactions/tag", json=payload)
-    queue_response = client.get("/review-queue/tenant_a")
+    response = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
+    queue_response = client.get("/review-queue/tenant_a", headers=_headers("tenant_a"))
 
     assert response.status_code == 200
     data = response.json()
@@ -180,7 +186,7 @@ def test_tag_endpoint_llm_result_invalid_for_tenant_routes_to_unknown() -> None:
         "idempotency_key": _unique_key("idem_007"),
     }
 
-    response = client.post("/transactions/tag", json=payload)
+    response = client.post("/transactions/tag", json=payload, headers=_headers("tenant_b"))
 
     assert response.status_code == 200
     data = response.json()
@@ -204,7 +210,7 @@ def test_resolve_review_item_accept_removes_from_queue() -> None:
         "ocr_text": None,
         "idempotency_key": _unique_key("idem_008"),
     }
-    client.post("/transactions/tag", json=payload)
+    client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     resolve_response = client.post(
         f"/review-queue/{tx_id}/resolve",
@@ -213,8 +219,9 @@ def test_resolve_review_item_accept_removes_from_queue() -> None:
             "action": "accept",
             "final_coa_account_id": "7200",
         },
+        headers=_headers("tenant_a"),
     )
-    queue_response = client.get("/review-queue/tenant_a")
+    queue_response = client.get("/review-queue/tenant_a", headers=_headers("tenant_a"))
 
     assert resolve_response.status_code == 200
     data = resolve_response.json()
@@ -240,7 +247,7 @@ def test_resolve_review_item_correct_overrides_coa() -> None:
         "ocr_text": None,
         "idempotency_key": _unique_key("idem_009"),
     }
-    client.post("/transactions/tag", json=payload)
+    client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     resolve_response = client.post(
         f"/review-queue/{tx_id}/resolve",
@@ -249,6 +256,7 @@ def test_resolve_review_item_correct_overrides_coa() -> None:
             "action": "correct",
             "final_coa_account_id": "6100",
         },
+        headers=_headers("tenant_a"),
     )
 
     assert resolve_response.status_code == 200
@@ -273,7 +281,7 @@ def test_reviewer_correction_promotes_vendor_rule_for_next_transaction() -> None
         "ocr_text": None,
         "idempotency_key": _unique_key("idem_011"),
     }
-    first_response = client.post("/transactions/tag", json=first_payload)
+    first_response = client.post("/transactions/tag", json=first_payload, headers=_headers("tenant_a"))
     assert first_response.status_code == 200
     assert first_response.json()["status"] == "REVIEW_QUEUE"
 
@@ -284,6 +292,7 @@ def test_reviewer_correction_promotes_vendor_rule_for_next_transaction() -> None
             "action": "correct",
             "final_coa_account_id": "6100",
         },
+        headers=_headers("tenant_a"),
     )
     assert resolve_response.status_code == 200
     assert resolve_response.json()["rule_created"] is True
@@ -299,7 +308,7 @@ def test_reviewer_correction_promotes_vendor_rule_for_next_transaction() -> None
         "ocr_text": None,
         "idempotency_key": _unique_key("idem_012"),
     }
-    second_response = client.post("/transactions/tag", json=second_payload)
+    second_response = client.post("/transactions/tag", json=second_payload, headers=_headers("tenant_a"))
 
     assert second_response.status_code == 200
     data = second_response.json()
@@ -324,7 +333,7 @@ def test_resolve_review_item_rejects_invalid_tenant_coa_account() -> None:
         "ocr_text": None,
         "idempotency_key": _unique_key("idem_010"),
     }
-    client.post("/transactions/tag", json=payload)
+    client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
 
     resolve_response = client.post(
         f"/review-queue/{tx_id}/resolve",
@@ -333,9 +342,29 @@ def test_resolve_review_item_rejects_invalid_tenant_coa_account() -> None:
             "action": "correct",
             "final_coa_account_id": "9999",
         },
+        headers=_headers("tenant_a"),
     )
 
     assert resolve_response.status_code == 422
+
+
+def test_tenant_auth_rejects_invalid_api_key() -> None:
+    client = TestClient(app)
+    payload = {
+        "tx_id": "manual_auth_001",
+        "tenant_id": "tenant_a",
+        "vendor_raw": "Zoom US",
+        "amount": "20.00",
+        "currency": "USD",
+        "date": "2026-04-29",
+        "transaction_type": "card",
+        "ocr_text": None,
+        "idempotency_key": _unique_key("idem_auth_001"),
+    }
+
+    response = client.post("/transactions/tag", json=payload, headers={"X-API-Key": "wrong_key"})
+
+    assert response.status_code == 403
 
 
 def test_load_app_config_reads_tenants() -> None:

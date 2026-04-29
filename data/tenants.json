@@ -3,6 +3,7 @@
     {
       "tenant_id": "tenant_a",
       "tenant_name": "Tenant A",
+      "api_key": "demo_key_tenant_a",
       "review_threshold": 0.5,
       "auto_post_threshold": 0.85,
       "coa_path": "data/coa/tenant_a.json",
@@ -11,6 +12,7 @@
     {
       "tenant_id": "tenant_b",
       "tenant_name": "Tenant B",
+      "api_key": "demo_key_tenant_b",
       "review_threshold": 0.5,
       "auto_post_threshold": 0.85,
       "coa_path": "data/coa/tenant_b.json",

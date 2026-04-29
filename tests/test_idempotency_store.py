@@ -8,7 +8,8 @@ from app.store.idempotency_store import IdempotencyStore
 
 
 def test_idempotency_store_persists_and_reads_cache_entries(tmp_path: Path) -> None:
-    store = IdempotencyStore(tmp_path)
+    db_path = tmp_path / "state.db"
+    store = IdempotencyStore(db_path)
     result = TaggingResult(
         tx_id="tx_902",
         tenant_id="tenant_a",
@@ -22,7 +23,7 @@ def test_idempotency_store_persists_and_reads_cache_entries(tmp_path: Path) -> N
     )
     store.put("tenant_a", "idem_902", "fingerprint-1", result)
 
-    reloaded = IdempotencyStore(tmp_path)
+    reloaded = IdempotencyStore(db_path)
     loaded = reloaded.get("tenant_a", "idem_902")
 
     assert loaded is not None

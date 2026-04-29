@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 
 from app.adapters.accounting_sync import MockAccountingSyncAdapter
 from app.config import AppConfig, load_app_config
@@ -32,18 +32,20 @@ from app.store.rule_store import RuleStore
 APP_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = APP_ROOT / "data" / "tenants.json"
 RUNTIME_DIR = APP_ROOT / "data" / "runtime"
+STATE_DB_PATH = RUNTIME_DIR / "state.db"
 
 app = FastAPI(title="Reap CFO Agent", version="0.1.0")
 app_config: AppConfig = load_app_config(CONFIG_PATH)
-audit_store = AuditLogStore(RUNTIME_DIR / "audit")
+audit_store = AuditLogStore(STATE_DB_PATH)
 accounting_sync = MockAccountingSyncAdapter()
-idempotency_store = IdempotencyStore(RUNTIME_DIR / "idempotency")
-review_queue_store = ReviewQueueStore()
+idempotency_store = IdempotencyStore(STATE_DB_PATH)
+review_queue_store = ReviewQueueStore(STATE_DB_PATH)
 processing_lock = threading.RLock()
 
 coa_by_tenant: dict[str, list[CoAAccount]] = {}
 coa_ids_by_tenant: dict[str, set[str]] = {}
 rules_paths: dict[str, str] = {}
+api_keys_by_tenant: dict[str, str] = {}
 for configured_tenant_id, tenant_cfg in app_config.tenants.items():
     coa_payload = json.loads((APP_ROOT / tenant_cfg.coa_path).read_text(encoding="utf-8"))
     coa_by_tenant[configured_tenant_id] = [CoAAccount(**item) for item in coa_payload]
@@ -51,6 +53,7 @@ for configured_tenant_id, tenant_cfg in app_config.tenants.items():
         item.account_id for item in coa_by_tenant[configured_tenant_id]
     }
     rules_paths[configured_tenant_id] = tenant_cfg.rules_path
+    api_keys_by_tenant[configured_tenant_id] = tenant_cfg.api_key
 
 rule_store = RuleStore(APP_ROOT, rules_paths, coa_ids_by_tenant)
 llm_classifier = LLMClassifier()
@@ -62,6 +65,15 @@ def _transaction_fingerprint(transaction: Transaction) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _authorize_tenant_request(tenant_id: str, api_key: str | None) -> None:
+    """Authorizes tenant-scoped requests using static per-tenant API keys."""
+    expected_key = api_keys_by_tenant.get(tenant_id)
+    if expected_key is None:
+        raise HTTPException(status_code=404, detail="Unknown tenant_id.")
+    if not api_key or api_key != expected_key:
+        raise HTTPException(status_code=403, detail="Invalid API key for tenant.")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Returns a basic service health response."""
@@ -69,10 +81,12 @@ def health() -> dict[str, str]:
 
 
 @app.post("/transactions/tag")
-def tag_transaction(transaction: Transaction) -> TaggingResult:
+def tag_transaction(
+    transaction: Transaction,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> TaggingResult:
     """Tags one transaction with rule-first then classifier routing."""
-    if transaction.tenant_id not in app_config.tenants:
-        raise HTTPException(status_code=404, detail="Unknown tenant_id.")
+    _authorize_tenant_request(transaction.tenant_id, x_api_key)
 
     payload_fingerprint = _transaction_fingerprint(transaction)
     with processing_lock:
@@ -186,10 +200,12 @@ def tag_transaction(transaction: Transaction) -> TaggingResult:
 
 
 @app.get("/review-queue/{tenant_id}")
-def get_review_queue(tenant_id: str) -> list[dict[str, object]]:
+def get_review_queue(
+    tenant_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict[str, object]]:
     """Returns pending review queue items for one tenant."""
-    if tenant_id not in app_config.tenants:
-        raise HTTPException(status_code=404, detail="Unknown tenant_id.")
+    _authorize_tenant_request(tenant_id, x_api_key)
     return [
         {
             "tx_id": item.tx_id,
@@ -202,10 +218,13 @@ def get_review_queue(tenant_id: str) -> list[dict[str, object]]:
 
 
 @app.post("/review-queue/{tx_id}/resolve")
-def resolve_review_item(tx_id: str, request: ReviewResolveRequest) -> ReviewResolveResponse:
+def resolve_review_item(
+    tx_id: str,
+    request: ReviewResolveRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> ReviewResolveResponse:
     """Resolves a review queue item by accepting or correcting the suggested account."""
-    if request.tenant_id not in app_config.tenants:
-        raise HTTPException(status_code=404, detail="Unknown tenant_id.")
+    _authorize_tenant_request(request.tenant_id, x_api_key)
 
     valid_coa_ids = coa_ids_by_tenant[request.tenant_id]
     if request.final_coa_account_id not in valid_coa_ids:
@@ -250,16 +269,20 @@ def resolve_review_item(tx_id: str, request: ReviewResolveRequest) -> ReviewReso
 
 
 @app.get("/audit-log/{tenant_id}")
-def get_audit_log(tenant_id: str) -> list[TaggingResult]:
+def get_audit_log(
+    tenant_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[TaggingResult]:
     """Returns tenant-scoped audit events."""
-    if tenant_id not in app_config.tenants:
-        raise HTTPException(status_code=404, detail="Unknown tenant_id.")
+    _authorize_tenant_request(tenant_id, x_api_key)
     return audit_store.list_by_tenant(tenant_id)
 
 
 @app.get("/rules/{tenant_id}")
-def get_rules(tenant_id: str) -> list[dict[str, object]]:
+def get_rules(
+    tenant_id: str,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict[str, object]]:
     """Returns current deterministic rules for one tenant."""
-    if tenant_id not in app_config.tenants:
-        raise HTTPException(status_code=404, detail="Unknown tenant_id.")
+    _authorize_tenant_request(tenant_id, x_api_key)
     return [rule.model_dump(mode="json") for rule in rule_store.list_rules(tenant_id)]

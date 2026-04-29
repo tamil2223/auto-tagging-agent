@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class TenantConfig(BaseModel):
     tenant_id: str
     tenant_name: str
+    api_key: str
     review_threshold: float = Field(ge=0.0, le=1.0)
     auto_post_threshold: float = Field(ge=0.0, le=1.0)
     coa_path: str
