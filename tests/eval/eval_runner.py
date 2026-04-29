@@ -83,8 +83,8 @@ def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float]:
                 rule_total += 1
 
             confidence = result.get("confidence")
-            if isinstance(confidence, (float, int)):
-                is_correct = 1.0 if (status == expected_status and (expected_coa is None or actual_coa == expected_coa)) else 0.0
+            if isinstance(confidence, (float, int)) and expected_coa is not None:
+                is_correct = 1.0 if (status == expected_status and actual_coa == expected_coa) else 0.0
                 brier_sum += (float(confidence) - is_correct) ** 2
                 brier_count += 1
 

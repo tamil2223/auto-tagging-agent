@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -28,6 +29,8 @@ class LLMClassificationResult:
 
 
 CompletionFn = Callable[..., object]
+EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b")
+CARD_LAST4_RE = re.compile(r"\b\d{4}\b")
 
 
 class LLMClassifier:
@@ -163,12 +166,22 @@ def _build_messages(
         f"Amount: {transaction.amount} {transaction.currency}\n"
         f"Date: {transaction.date}\n"
         f"Type: {transaction.transaction_type}\n"
-        f"OCR: {transaction.ocr_text or 'Not available'}"
+        f"OCR: {sanitize_ocr_text(transaction.ocr_text)}"
     )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def sanitize_ocr_text(ocr_text: str | None) -> str:
+    """Redacts obvious PII patterns from OCR text before prompt construction."""
+    if not ocr_text:
+        return "Not available"
+
+    sanitized = EMAIL_RE.sub("[REDACTED_EMAIL]", ocr_text)
+    sanitized = CARD_LAST4_RE.sub("[REDACTED_4DIGITS]", sanitized)
+    return sanitized
 
 
 def _parse_response_output(response: object) -> LLMClassificationOutput:
