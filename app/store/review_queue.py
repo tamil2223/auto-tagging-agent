@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from app.models import TaggingResult
+from app.models import ReviewQueueItem
 
 
 class ReviewQueueStore:
@@ -11,19 +11,19 @@ class ReviewQueueStore:
     def __init__(self) -> None:
         """Initializes an in-memory queue grouped by tenant."""
         self._lock = threading.RLock()
-        self._items: dict[str, list[TaggingResult]] = {}
+        self._items: dict[str, list[ReviewQueueItem]] = {}
 
-    def add(self, result: TaggingResult) -> None:
-        """Adds one tagging result into the tenant review queue.
+    def add(self, item: ReviewQueueItem) -> None:
+        """Adds one review item into the tenant queue.
 
         Args:
-            result: Review-queued tagging result event.
+            item: Review queue item.
         """
         with self._lock:
-            tenant_items = self._items.setdefault(result.tenant_id, [])
-            tenant_items.append(result)
+            tenant_items = self._items.setdefault(item.tenant_id, [])
+            tenant_items.append(item)
 
-    def resolve(self, tenant_id: str, tx_id: str) -> TaggingResult | None:
+    def resolve(self, tenant_id: str, tx_id: str) -> ReviewQueueItem | None:
         """Removes and returns a queued item by transaction ID.
 
         Args:
@@ -40,7 +40,7 @@ class ReviewQueueStore:
                     return tenant_items.pop(index)
             return None
 
-    def list_by_tenant(self, tenant_id: str) -> list[TaggingResult]:
+    def list_by_tenant(self, tenant_id: str) -> list[ReviewQueueItem]:
         """Lists pending review items for a tenant.
 
         Args:

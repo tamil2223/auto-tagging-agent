@@ -138,10 +138,11 @@ def test_tag_endpoint_llm_path_auto_tags_when_confidence_is_high() -> None:
 
 def test_tag_endpoint_llm_path_routes_to_review_queue_when_confidence_is_medium() -> None:
     client = TestClient(app)
+    vendor_raw = f"Grab SG {_unique_key('mid')}"
     payload = {
         "tx_id": "tx_006",
         "tenant_id": "tenant_a",
-        "vendor_raw": "Grab SG 0023",
+        "vendor_raw": vendor_raw,
         "amount": "18.50",
         "currency": "SGD",
         "date": "2026-04-29",
@@ -191,10 +192,11 @@ def test_tag_endpoint_llm_result_invalid_for_tenant_routes_to_unknown() -> None:
 def test_resolve_review_item_accept_removes_from_queue() -> None:
     client = TestClient(app)
     tx_id = _unique_key("tx_008")
+    vendor_raw = f"Grab SG {_unique_key('accept')}"
     payload = {
         "tx_id": tx_id,
         "tenant_id": "tenant_a",
-        "vendor_raw": "Grab SG 0023",
+        "vendor_raw": vendor_raw,
         "amount": "18.50",
         "currency": "SGD",
         "date": "2026-04-29",
@@ -226,10 +228,11 @@ def test_resolve_review_item_accept_removes_from_queue() -> None:
 def test_resolve_review_item_correct_overrides_coa() -> None:
     client = TestClient(app)
     tx_id = _unique_key("tx_009")
+    vendor_raw = f"Grab SG {_unique_key('correct')}"
     payload = {
         "tx_id": tx_id,
         "tenant_id": "tenant_a",
-        "vendor_raw": "Grab SG 0023",
+        "vendor_raw": vendor_raw,
         "amount": "18.50",
         "currency": "SGD",
         "date": "2026-04-29",
@@ -252,16 +255,68 @@ def test_resolve_review_item_correct_overrides_coa() -> None:
     data = resolve_response.json()
     assert data["result"]["status"] == "AUTO_TAG"
     assert data["result"]["coa_account_id"] == "6100"
-    assert data["rule_created"] is False
+    assert data["rule_created"] is True
+
+
+def test_reviewer_correction_promotes_vendor_rule_for_next_transaction() -> None:
+    client = TestClient(app)
+    vendor_raw = f"Grab SG {_unique_key('vendor')}"
+    first_tx_id = _unique_key("tx_011")
+    first_payload = {
+        "tx_id": first_tx_id,
+        "tenant_id": "tenant_a",
+        "vendor_raw": vendor_raw,
+        "amount": "18.50",
+        "currency": "SGD",
+        "date": "2026-04-29",
+        "transaction_type": "card",
+        "ocr_text": None,
+        "idempotency_key": _unique_key("idem_011"),
+    }
+    first_response = client.post("/transactions/tag", json=first_payload)
+    assert first_response.status_code == 200
+    assert first_response.json()["status"] == "REVIEW_QUEUE"
+
+    resolve_response = client.post(
+        f"/review-queue/{first_tx_id}/resolve",
+        json={
+            "tenant_id": "tenant_a",
+            "action": "correct",
+            "final_coa_account_id": "6100",
+        },
+    )
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["rule_created"] is True
+
+    second_payload = {
+        "tx_id": _unique_key("tx_012"),
+        "tenant_id": "tenant_a",
+        "vendor_raw": vendor_raw,
+        "amount": "22.00",
+        "currency": "SGD",
+        "date": "2026-04-29",
+        "transaction_type": "card",
+        "ocr_text": None,
+        "idempotency_key": _unique_key("idem_012"),
+    }
+    second_response = client.post("/transactions/tag", json=second_payload)
+
+    assert second_response.status_code == 200
+    data = second_response.json()
+    assert data["status"] == "AUTO_TAG"
+    assert data["source"] == "rule"
+    assert data["confidence"] == 1.0
+    assert data["coa_account_id"] == "6100"
 
 
 def test_resolve_review_item_rejects_invalid_tenant_coa_account() -> None:
     client = TestClient(app)
     tx_id = _unique_key("tx_010")
+    vendor_raw = f"Grab SG {_unique_key('invalid')}"
     payload = {
         "tx_id": tx_id,
         "tenant_id": "tenant_a",
-        "vendor_raw": "Grab SG 0023",
+        "vendor_raw": vendor_raw,
         "amount": "18.50",
         "currency": "SGD",
         "date": "2026-04-29",

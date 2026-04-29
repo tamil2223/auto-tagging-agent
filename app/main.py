@@ -12,8 +12,10 @@ from app.adapters.accounting_sync import MockAccountingSyncAdapter
 from app.config import AppConfig, load_app_config
 from app.models import (
     CoAAccount,
+    ReviewQueueItem,
     ReviewResolveRequest,
     ReviewResolveResponse,
+    VendorRule,
     TaggingResult,
     Transaction,
 )
@@ -141,7 +143,17 @@ def tag_transaction(transaction: Transaction) -> TaggingResult:
                 if status == "AUTO_TAG":
                     accounting_sync.sync(result)
                 if status == "REVIEW_QUEUE":
-                    review_queue_store.add(result)
+                    review_queue_store.add(
+                        ReviewQueueItem(
+                            tx_id=transaction.tx_id,
+                            tenant_id=transaction.tenant_id,
+                            vendor_key=vendor_key,
+                            suggested_coa_account_id=classification.coa_account_id,
+                            confidence=classification.confidence,
+                            reasoning=classification.reasoning,
+                            idempotency_key=transaction.idempotency_key,
+                        )
+                    )
 
         idempotency_store.put(
             transaction.tenant_id,
@@ -160,7 +172,7 @@ def get_review_queue(tenant_id: str) -> list[dict[str, object]]:
     return [
         {
             "tx_id": item.tx_id,
-            "coa_account_id": item.coa_account_id,
+            "coa_account_id": item.suggested_coa_account_id,
             "confidence": item.confidence,
             "reasoning": item.reasoning,
         }
@@ -200,8 +212,20 @@ def resolve_review_item(tx_id: str, request: ReviewResolveRequest) -> ReviewReso
         )
         audit_store.append(resolved_result)
         accounting_sync.sync(resolved_result)
+        rule_created = False
+        if request.action == "correct":
+            promoted_rule = VendorRule(
+                tenant_id=request.tenant_id,
+                vendor_key=queued_item.vendor_key,
+                coa_account_id=request.final_coa_account_id,
+                created_by="reviewer",
+                created_at=datetime.now(timezone.utc),
+                source_tx_id=tx_id,
+            )
+            rule_store.upsert_rule(promoted_rule)
+            rule_created = True
 
-        return ReviewResolveResponse(result=resolved_result, rule_created=False)
+        return ReviewResolveResponse(result=resolved_result, rule_created=rule_created)
 
 
 @app.get("/audit-log/{tenant_id}")

@@ -62,3 +62,13 @@ class ReviewResolveRequest(BaseModel):
 class ReviewResolveResponse(BaseModel):
     result: TaggingResult
     rule_created: bool
+
+
+class ReviewQueueItem(BaseModel):
+    tx_id: str
+    tenant_id: str
+    vendor_key: str
+    suggested_coa_account_id: str
+    confidence: float
+    reasoning: str
+    idempotency_key: str
