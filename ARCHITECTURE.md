@@ -35,9 +35,14 @@ flowchart TD
     API --> Service[TaggingService<br/>app/services/tagging_service.py]
 
     Service --> Pre[Preprocessor<br/>normalize + sanitize OCR]
-    Service --> Rule[RuleStore<br/>tenant vendor rules]
+    Pre --> LLM
+    Service -->|rule lookup| Rule[RuleStore<br/>tenant vendor rules]
     Service --> LLM[LLMClassifier<br/>provider chain or deterministic fallback]
-    Service --> Val[Validator + Router<br/>CoA check + confidence routing]
+    Service --> Val[Validator<br/>schema + CoA membership]
+    Val --> Router[Confidence Router<br/>AUTO_TAG / REVIEW_QUEUE / UNKNOWN]
+    Router -->|AUTO_TAG| Sync[MockAccountingSyncAdapter]
+    Router -->|REVIEW_QUEUE| Review[(ReviewQueueStore<br/>SQLite)]
+    Router -->|UNKNOWN| Audit[(AuditLogStore<br/>SQLite)]
 
     LLM --> Prompt[llm_prompt.py]
     LLM --> Provider[llm_provider.py]
@@ -45,15 +50,15 @@ flowchart TD
 
     Provider --> ExtLLM[(Gemini / Claude / OpenAI)]
 
-    Service --> Audit[(AuditLogStore<br/>SQLite)]
     Service --> Idem[(IdempotencyStore<br/>SQLite)]
-    Service --> Review[(ReviewQueueStore<br/>SQLite)]
     Service --> Examples[(ConfirmedExampleStore<br/>SQLite)]
-    Service --> Sync[MockAccountingSyncAdapter]
+    Service --> Audit
+    Service --> Review
+    Service --> Sync
 
     Review --> Reviewer[Finance Reviewer]
     Reviewer --> API
-    Service --> Rule
+    Service -->|upsert on reviewer correct| Rule
 
     subgraph TenantScope[Tenant Isolation Boundary]
       Rule
@@ -70,58 +75,76 @@ flowchart TD
 sequenceDiagram
     participant Client
     participant API as FastAPI (/transactions/tag)
+    participant Auth as API Key Auth
+    participant Idem as IdempotencyStore
     participant Rule as RuleStore
     participant LLM as LLMClassifier
-    participant Val as Validator+Router
+    participant Val as Validator
+    participant Router as Confidence Router
     participant RQ as ReviewQueueStore
     participant Audit as AuditLog
     participant Sync as AccountingSync
     participant Reviewer
 
     Client->>API: POST /transactions/tag
-    API->>Rule: match(tenant_id, vendor_key)
-    alt Deterministic rule hit
-        Rule-->>API: coa_account_id
-        API->>Audit: append(AUTO_TAG, source=rule)
-        API->>Sync: sync(AUTO_TAG)
-        API-->>Client: TaggingResult(AUTO_TAG)
-    else No rule
-        API->>LLM: classify(transaction, tenant_coa)
-        LLM-->>API: output or provider error
-        API->>Val: validate + route_by_confidence
-        alt AUTO_TAG
-            API->>Audit: append(AUTO_TAG, source=llm)
+    API->>Auth: validate X-API-Key + tenant scope
+    Auth-->>API: authorized
+    API->>Idem: check(tenant_id, idempotency_key)
+    alt Duplicate request (same payload)
+        Idem-->>API: cached TaggingResult
+        API-->>Client: TaggingResult (cached)
+    else New request
+        API->>Rule: match(tenant_id, vendor_key)
+        alt Deterministic rule hit
+            Rule-->>API: coa_account_id
+            API->>Audit: append(AUTO_TAG, source=rule)
             API->>Sync: sync(AUTO_TAG)
             API-->>Client: TaggingResult(AUTO_TAG)
-        else REVIEW_QUEUE
-            API->>RQ: add(review item)
-            API->>Audit: append(REVIEW_QUEUE)
-            API-->>Client: TaggingResult(REVIEW_QUEUE)
-            Reviewer->>API: POST /review-queue/{tx_id}/resolve
-            API->>RQ: resolve(tx_id)
-            API->>Audit: append(AUTO_TAG reviewer result)
-            opt action == correct
-                API->>Rule: upsert vendor rule
+        else No rule
+            API->>LLM: classify(transaction, tenant_coa)
+            LLM-->>API: output or provider error
+            API->>Val: validate(CoA membership + schema)
+            alt Validation failure
+                Val-->>API: invalid output
+                API->>Audit: append(UNKNOWN, reason=validation_failure)
+                API-->>Client: TaggingResult(UNKNOWN)
+            else Validation success
+                API->>Router: route_by_confidence
+                alt AUTO_TAG
+                    API->>Audit: append(AUTO_TAG, source=llm)
+                    API->>Sync: sync(AUTO_TAG)
+                    API-->>Client: TaggingResult(AUTO_TAG)
+                else REVIEW_QUEUE
+                    API->>RQ: add(review item)
+                    API->>Audit: append(REVIEW_QUEUE)
+                    API-->>Client: TaggingResult(REVIEW_QUEUE)
+                    Reviewer->>API: POST /review-queue/{tx_id}/resolve
+                    API->>RQ: resolve(tx_id)
+                    API->>Audit: append(AUTO_TAG reviewer result)
+                    opt action == correct
+                        API->>Rule: upsert vendor rule
+                    end
+                    API->>Sync: sync(AUTO_TAG reviewer result)
+                    API-->>Reviewer: ReviewResolveResponse
+                else UNKNOWN
+                    API->>Audit: append(UNKNOWN)
+                    API-->>Client: TaggingResult(UNKNOWN)
+                end
             end
-            API->>Sync: sync(AUTO_TAG reviewer result)
-            API-->>Reviewer: ReviewResolveResponse
-        else UNKNOWN
-            API->>Audit: append(UNKNOWN)
-            API-->>Client: TaggingResult(UNKNOWN)
         end
     end
 ```
 
 ## 3) Architectural Invariants
 
-| Invariant | Enforcement |
-|---|---|
-| LLM output must map to tenant CoA only | Validator + CoA membership check before routing |
-| 4xx provider errors must not fan out to other providers | LLM classifier stops fallback on 4xx |
-| 5xx/timeouts may fallback across providers | Provider chain retries/fallback |
-| All decisions are auditable | Audit log append on every terminal result |
-| Tenant isolation for reads/writes | Tenant-scoped stores + API key authorization |
-| Replay safety in review resolve | Replays must match original `action` + `final_coa_account_id` or return `409` |
+| Invariant                                               | Enforcement                                                                   |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| LLM output must map to tenant CoA only                  | Validator + CoA membership check before routing                               |
+| 4xx provider errors must not fan out to other providers | LLM classifier stops fallback on 4xx                                          |
+| 5xx/timeouts may fallback across providers              | Provider chain retries/fallback                                               |
+| All decisions are auditable                             | Audit log append on every terminal result                                     |
+| Tenant isolation for reads/writes                       | Tenant-scoped stores + API key authorization                                  |
+| Replay safety in review resolve                         | Replays must match original `action` + `final_coa_account_id` or return `409` |
 
 ## 4) System Components
 
@@ -143,6 +166,7 @@ sequenceDiagram
 ## 5) API Contracts (MVP)
 
 ### `POST /transactions/tag`
+
 - Input: `Transaction`
 - Output: `TaggingResult`
 - Error behaviors:
@@ -151,9 +175,11 @@ sequenceDiagram
   - `409` idempotency payload conflict.
 
 ### `GET /review-queue/{tenant_id}`
+
 - Returns pending review items for tenant.
 
 ### `POST /review-queue/{tx_id}/resolve`
+
 - Input: `{tenant_id, action, final_coa_account_id, reviewer_id?}`
 - Output: `ReviewResolveResponse`
 - Behaviors:
@@ -162,6 +188,7 @@ sequenceDiagram
   - `409` if replay payload conflicts with previously resolved payload.
 
 ### `GET /audit-log/{tenant_id}`, `GET /rules/{tenant_id}`
+
 - Tenant-scoped read APIs for observability and deterministic rule inspection.
 
 ## 6) Failure-Mode Strategy
@@ -175,15 +202,184 @@ sequenceDiagram
 
 ## 7) MVP vs Production Boundary
 
-| Concern | MVP (this repo) | Production direction |
-|---|---|---|
-| Orchestration | `TaggingService`; sync in-process execution | Async workflow with queue + worker fleet |
-| Persistence | SQLite (`data/runtime/state.db`) + JSON seed files | Postgres + migrations + backup/restore |
-| Auth | Static per-tenant `X-API-Key` | OAuth2/API gateway/mTLS + key rotation |
-| LLM integration | LiteLLM, env-driven provider chain | Circuit breakers, budget controls, tenant policies |
-| PII | Regex redaction | DLP/NER + policy-based retention |
-| Observability | Structured app logs | OpenTelemetry + SLOs + alerting |
-| Concurrency control | In-process `threading.RLock` | Distributed locks / transactional constraints |
+| Concern             | MVP (this repo)                                    | Production direction                               |
+| ------------------- | -------------------------------------------------- | -------------------------------------------------- |
+| Orchestration       | `TaggingService`; sync in-process execution        | Async workflow with queue + worker fleet           |
+| Persistence         | SQLite (`data/runtime/state.db`) + JSON seed files | Postgres + migrations + backup/restore             |
+| Auth                | Static per-tenant `X-API-Key`                      | OAuth2/API gateway/mTLS + key rotation             |
+| LLM integration     | LiteLLM, env-driven provider chain                 | Circuit breakers, budget controls, tenant policies |
+| PII                 | Regex redaction                                    | DLP/NER + policy-based retention                   |
+| Observability       | Structured app logs                                | OpenTelemetry + SLOs + alerting                    |
+| Concurrency control | In-process `threading.RLock`                       | Distributed locks / transactional constraints      |
+
+### Production Target Component Diagram
+
+```mermaid
+flowchart TD
+    Ingest[Transaction/OCR Event Streams] --> GW[API Gateway + AuthN/AuthZ]
+    GW --> API[Tagging API Service]
+    API --> Idem[Idempotency Guard<br/>Postgres unique keys + txn checks]
+    Idem --> Q[Queue / Stream<br/>Kafka or SQS]
+    Q --> W[Tagging Worker Fleet]
+
+    W --> Rule[Rule Service<br/>tenant-scoped deterministic rules]
+    W --> Prompt[Prompt Builder + Policy Guardrails]
+    Confirmed[(Confirmed Examples Store<br/>tenant-confirmed tags)] --> Vector[(Vector Retrieval Index<br/>pgvector)]
+    W --> Vector
+    Vector --> Prompt
+    Prompt --> LLM[LLM Orchestrator]
+    LLM --> Retry[Retry + Backoff Policy]
+    LLM --> CB[Circuit Breaker]
+    LLM --> Budget[Spend Cap Enforcer]
+    Retry --> Providers[(Gemini / Claude / OpenAI)]
+    CB --> Providers
+    Budget --> Providers
+
+    W --> Val[Schema + CoA Validator]
+    W --> Router[Confidence Router<br/>AUTO_TAG / REVIEW_QUEUE / UNKNOWN]
+
+    Router -->|AUTO_TAG| Sync[Accounting Adapter Service]
+    Router -->|REVIEW_QUEUE| Review[(Review Queue DB)]
+    Router -->|UNKNOWN| Unknown[(Unknown Bucket + Alerts)]
+    Review --> ReviewSLA[SLA Monitor + Escalation]
+
+    Review --> Reviewer[Finance Reviewer UI]
+    Reviewer --> Resolve[Review Resolve API]
+    Resolve --> RuleLearn[Rule Promotion Pipeline<br/>approval + rollback]
+    RuleLearn --> Rule
+
+    W --> Audit[(Append-only Audit Log)]
+    W --> State[(Postgres Operational State<br/>same cluster as Idem)]
+    W --> Cache[(Redis Cache<br/>tenant-partitioned keys)]
+
+    API --> Obs[OpenTelemetry Collector]
+    W --> Obs
+    LLM --> Obs
+    Obs --> Mon[Metrics + Traces + Alerts + SLO Dashboards]
+
+    subgraph ControlPlane[Control Plane]
+      Policy[Tenant Policy Service<br/>thresholds, provider policy, spend caps]
+      Secrets[Secrets Manager]
+      Feature[Feature Flags / Progressive Rollout]
+    end
+
+    Policy --> API
+    Policy --> W
+    Secrets --> LLM
+    Feature --> API
+    Feature --> W
+
+    subgraph DataBoundary[Tenant Isolation Boundary]
+      Rule
+      Review
+      State
+      Audit
+      Confirmed
+      Vector
+      Cache
+    end
+```
+
+### Production Target Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Upstream as Upstream Stream
+    participant GW as API Gateway
+    participant API as Tagging API
+    participant Idem as Idempotency Guard (Postgres)
+    participant Q as Queue/Stream
+    participant Worker as Tagging Worker
+    participant Policy as Tenant Policy Service
+    participant Rule as Rule Service
+    participant LLM as LLM Orchestrator
+    participant P1 as Provider-1 (Gemini)
+    participant P2 as Provider-2 (Claude)
+    participant P3 as Provider-3 (OpenAI)
+    participant Router as Validator + Confidence Router
+    participant Review as Review Queue DB
+    participant RuleLearn as Rule Promotion Pipeline
+    participant Approver as Secondary Approver / Policy Gate
+    participant Status as Result API / Callback
+    participant Sync as Accounting Adapter
+    participant Audit as Audit Log
+    participant Reviewer as Finance Reviewer
+    participant Resolve as Review Resolve API
+
+    Upstream->>GW: Transaction + tenant context
+    GW->>API: Authenticated request
+    API->>Idem: Reserve/check idempotency key
+    alt Duplicate request (same payload)
+        Idem-->>API: Cached terminal result
+        API-->>GW: Return cached result
+    else New request
+        Idem-->>API: Accepted
+        API->>Q: Enqueue classification job
+        API-->>GW: 202 Accepted + tracking id
+        Q->>Worker: Deliver job
+        Worker->>Policy: Fetch tenant thresholds + provider policy
+        Worker->>Rule: Deterministic vendor match?
+        alt Rule hit
+            Rule-->>Worker: CoA match
+            Worker->>Router: Build AUTO_TAG (source=rule)
+        else No rule
+            Worker->>LLM: Classify with guardrails + timeout budget
+            LLM->>P1: Primary call
+            alt P1 success
+                P1-->>LLM: Structured output
+            else P1 429
+                LLM->>LLM: Exponential backoff (bounded retries)
+                LLM->>P1: Retry call
+                alt Retry success
+                    P1-->>LLM: Structured output
+                else Retry exhausted
+                    LLM->>P2: Fallback call
+                    alt P2 success
+                        P2-->>LLM: Structured output
+                    else P2 timeout/5xx
+                        LLM->>P3: Final fallback call
+                        alt P3 success
+                            P3-->>LLM: Structured output
+                        else P3 timeout/5xx
+                            LLM-->>Worker: providers_exhausted
+                        end
+                    end
+                end
+            else P1 non-429 4xx
+                LLM-->>Worker: terminal refusal (no cross-provider fallback)
+            end
+            Worker->>Router: Validate CoA + route by confidence
+        end
+
+        alt Routed AUTO_TAG
+            Worker->>Sync: Post accounting entry
+            Worker->>Audit: Append AUTO_TAG event
+        else Routed REVIEW_QUEUE
+            Worker->>Review: Persist review item
+            Worker->>Audit: Append REVIEW_QUEUE event
+        else Routed UNKNOWN
+            Worker->>Audit: Append UNKNOWN event
+        end
+        Worker->>Status: Publish terminal TaggingResult
+    end
+    API-->>Upstream: 202 accepted; client polls status or receives callback
+
+    Reviewer->>Resolve: Resolve(review_item_id, action, final_coa)
+    Resolve->>Review: Load + mark resolved idempotently
+    alt action == correct
+        Resolve->>RuleLearn: Submit promotion candidate
+        RuleLearn->>Approver: Evaluate policy / concordance threshold
+        alt Approved
+            RuleLearn->>Rule: Upsert deterministic vendor rule
+        else Not yet approved
+            RuleLearn-->>Resolve: Candidate queued, rule not active yet
+        end
+    end
+    Resolve->>Sync: Post corrected accounting entry
+    Resolve->>Audit: Append reviewer resolution event
+    Resolve-->>Reviewer: Resolution accepted + replay-safe response
+```
 
 **Hard MVP deployment constraint**: single-process runtime only. `threading.RLock` is process-local and does not coordinate multi-worker or multi-replica deployments.
 
