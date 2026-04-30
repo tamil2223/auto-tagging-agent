@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -68,7 +69,8 @@ class ConfirmedExampleStore:
         if not items:
             return []
 
-        rng = random.Random(hash(tx_id))
+        seed = int(hashlib.sha256(tx_id.encode("utf-8")).hexdigest()[:16], 16)
+        rng = random.Random(seed)
         if len(items) <= limit:
             return items
         return rng.sample(items, limit)

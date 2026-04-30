@@ -106,11 +106,15 @@ class LLMClassifier:
                             continue
                         break
                     if status_code is not None and 400 <= status_code < 500:
+                        error_message = str(exc).replace("\n", " ").strip()
+                        if len(error_message) > 500:
+                            error_message = f"{error_message[:500]}..."
                         logger.warning(
-                            "LLM provider 4xx (no fallback) provider=%s tx=%s status=%s",
+                            "LLM provider 4xx (no fallback) provider=%s tx=%s status=%s error=%s",
                             provider.name,
                             transaction.tx_id,
                             status_code,
+                            error_message,
                         )
                         return LLMClassificationResult(
                             output=None,
