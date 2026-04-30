@@ -5,6 +5,7 @@ BASE_URL="${BASE_URL:-http://localhost:8000}"
 TENANT_A_KEY="${TENANT_A_KEY:-demo_key_tenant_a}"
 TENANT_B_KEY="${TENANT_B_KEY:-demo_key_tenant_b}"
 AUTO_START_SERVER="${AUTO_START_SERVER:-true}"
+SMOKE_LLM_ENABLE_LIVE_CALLS="${SMOKE_LLM_ENABLE_LIVE_CALLS:-false}"
 
 if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required."
@@ -15,6 +16,23 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required."
   exit 1
 fi
+
+read -r BASE_HOST BASE_PORT < <(
+  python3 - "$BASE_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+url = urlparse(sys.argv[1])
+host = url.hostname or "127.0.0.1"
+if url.port is not None:
+    port = url.port
+elif url.scheme == "https":
+    port = 443
+else:
+    port = 80
+print(host, port)
+PY
+)
 
 RUN_ID="$(python3 - <<'PY'
 import uuid
@@ -120,8 +138,9 @@ echo "Running smoke tests against ${BASE_URL} (run_id=${RUN_ID})"
 if ! health_ok; then
   if [[ "${AUTO_START_SERVER}" == "true" ]]; then
     echo "No server detected at ${BASE_URL}. Starting uvicorn for smoke tests..."
-    # Run server in background for smoke tests only.
-    python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --log-level warning >/tmp/reap_smoke_${RUN_ID}.log 2>&1 &
+    # Run server in background for smoke tests only, defaulting to deterministic mode.
+    LLM_ENABLE_LIVE_CALLS="${SMOKE_LLM_ENABLE_LIVE_CALLS}" \
+      python3 -m uvicorn app.main:app --host "${BASE_HOST}" --port "${BASE_PORT}" --log-level warning >/tmp/reap_smoke_${RUN_ID}.log 2>&1 &
     SERVER_PID="$!"
     if ! wait_for_health 15; then
       echo "FAIL: server did not become healthy in time. See /tmp/reap_smoke_${RUN_ID}.log"
