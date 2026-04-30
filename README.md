@@ -13,6 +13,58 @@ The agent auto-tags each transaction to a tenant-specific Chart of Accounts (CoA
 
 - **Workflow Chosen**: **Workflow 1 — Transaction auto-tagging and close acceleration**
 
+## Documentation Map
+
+- `README.md` (this file): executive summary, MVP scope, setup/run/test instructions, and submission context.
+- `ARCHITECTURE.md`: canonical system design, invariants, API architecture contracts, failure-mode handling, and MVP-vs-production boundary decisions.
+
+## Quick 5-Min Verify
+
+```bash
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+pytest -q
+BASE_URL="http://127.0.0.1:8011" AUTO_START_SERVER=true SMOKE_LLM_ENABLE_LIVE_CALLS=false bash scripts/smoke_test.sh
+```
+
+## MVP At A Glance (30 seconds)
+
+- Tags transactions to tenant CoA with a safety-first pipeline (`rule -> classifier -> review/unknown`).
+- Hard-validates classifier outputs against tenant CoA before any auto-post action.
+- Uses confidence routing with cold-start tightening to bias toward human review.
+- Persists audit/idempotency/review state in SQLite and supports reviewer-driven rule promotion.
+- Enforces request guardrails at API boundary (`vendor_raw` max 500 chars, `ocr_text` max 2000 chars).
+
+## Out of Scope for This MVP
+
+- Tax code and tracking-category prediction with dependency constraints.
+- Distributed concurrency guarantees across multi-worker or multi-replica deployments.
+- Advanced DLP/NER for all PII classes (current redaction is regex-focused).
+- Retrieval-based few-shot selection (current approach samples tenant-confirmed examples).
+
+## Production Migration Plan (Current -> Target)
+
+| Area               | Current MVP                      | Production Target                                    | Migration Trigger                                  |
+| :----------------- | :------------------------------- | :--------------------------------------------------- | :------------------------------------------------- |
+| Persistence        | SQLite + JSON seed/runtime files | Postgres + migrations + backups                      | Multi-worker deploy or sustained higher throughput |
+| Queueing & retries | In-process sync flow             | Queue-backed async workers + DLQ                     | Month-end burst pressure / downstream rate limits  |
+| AuthN/AuthZ        | Static tenant API keys           | OAuth2/API gateway/mTLS + key rotation               | External customer access and compliance reviews    |
+| LLM operations     | Env-based provider chain         | Budget caps, circuit breakers, tenant policies       | Live tenant rollout with spend/SLA targets         |
+| Retrieval quality  | Random tenant few-shot sampling  | Retrieval-based similarity examples (e.g., pgvector) | Long-tail performance plateau in eval metrics      |
+| Observability      | Application logs                 | Metrics/traces/alerts (OpenTelemetry)                | On-call ownership and SLO commitments              |
+
+## Known Risks & Mitigations
+
+- **Live provider availability**: upstream model/key issues can produce 4xx/5xx.  
+  **Mitigation**: safe refusal path to `UNKNOWN`; fallback + retries for retriable errors.
+- **Reviewer trust asymmetry**: a wrong correction can promote a bad deterministic rule.  
+  **Mitigation**: rule lineage (`created_by`, `created_at`, `source_tx_id`) and audit trail.
+- **Single-process lock scope**: `RLock` is process-local only.  
+  **Mitigation**: explicit single-process MVP constraint; production move to DB-backed concurrency control.
+- **Confidence calibration drift**: self-reported confidence may deviate over time.  
+  **Mitigation**: periodic eval harness run and recalibration trigger threshold.
+- **Large-CoA prompt pressure**: CoA prompt truncation/telemetry (`coa_truncated`) is not implemented in MVP.  
+  **Mitigation**: keep tenant CoA small for MVP fixtures; add truncation policy + telemetry before production rollout.
+
 ---
 
 ## Table of Contents
@@ -46,11 +98,21 @@ The agent is built around a **hybrid decision system**:
 
 **Primary success metric**: Auto-Tagging Rate (% of transactions tagged without human intervention), measured per tenant, trending upward over time as the rule store grows.
 
+**Business KPI targets (post-MVP rollout goals):**
+
+- Reduce average monthly close effort for this workflow from ~7 days toward ~2-3 days.
+- Reach 60%+ safe automation (`AUTO_TAG`) within the first 90 days of tenant onboarding.
+- Keep review backlog healthy (for example, 95% of review items resolved within 24 hours during month-end windows).
+
 **Scope (MVP)**: CoA tagging only. Tax codes, tracking categories, and other metadata are intentionally deferred so the correctness-first loop stays high-quality and testable within the time budget.
 
 ---
 
 ## 2. System Architecture
+
+Canonical architecture details now live in `ARCHITECTURE.md`.
+
+This section remains as a reviewer-friendly overview in the README; for implementation boundaries and production-oriented architecture decisions, use `ARCHITECTURE.md` as source of truth.
 
 ### 2.1 High-Level Flow
 
@@ -101,14 +163,14 @@ The agent is built around a **hybrid decision system**:
 
 ### 2.2 Key Invariants
 
-| Invariant | Enforcement point |
-| :--- | :--- |
-| LLM must only suggest accounts from the tenant's CoA | Application-layer validation after LLM response (not just prompt) |
-| Every decision is logged with source, confidence, and reasoning | Audit log written before any sync |
-| Provider timeouts/5xx/connection errors → fallback chain exhausted → `UNKNOWN`, never auto-tag | `llm_classifier.py` fallback chain; final catch routes to `UNKNOWN` |
-| Provider 4xx (e.g., prompt too long / content policy) → `UNKNOWN`, never auto-tag | `llm_classifier.py` treats 4xx as non-retriable (no fallback) to avoid leaking the same request to additional providers |
-| Invalid schema or hallucinated CoA account → `UNKNOWN`, never auto-tag | Output validation layer (Step 5) |
-| Thresholds are per-tenant configuration, not hardcoded | `TenantConfig` model |
+| Invariant                                                                                      | Enforcement point                                                                                                       |
+| :--------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- |
+| LLM must only suggest accounts from the tenant's CoA                                           | Application-layer validation after LLM response (not just prompt)                                                       |
+| Every decision is logged with source, confidence, and reasoning                                | Audit log written before any sync                                                                                       |
+| Provider timeouts/5xx/connection errors → fallback chain exhausted → `UNKNOWN`, never auto-tag | `llm_classifier.py` fallback chain; final catch routes to `UNKNOWN`                                                     |
+| Provider 4xx (e.g., prompt too long / content policy) → `UNKNOWN`, never auto-tag              | `llm_classifier.py` treats 4xx as non-retriable (no fallback) to avoid leaking the same request to additional providers |
+| Invalid schema or hallucinated CoA account → `UNKNOWN`, never auto-tag                         | Output validation layer (Step 5)                                                                                        |
+| Thresholds are per-tenant configuration, not hardcoded                                         | `TenantConfig` model                                                                                                    |
 
 ### 2.3 Project Structure
 
@@ -201,137 +263,31 @@ Error codes (minimal MVP set):
   - **Response**: updated `TaggingResult` + rule creation metadata if applicable
   - **422**: if `final_coa_account_id` is not in tenant CoA
 
-Production note: for strict tenant isolation, prefer scoping the resolve route by tenant in the path (e.g., `POST /tenants/{tenant_id}/review-queue/{tx_id}/resolve`) rather than relying on `tenant_id` in the request body.
+Tenant-isolation hardening details are tracked in §9 (**Review resolve route hardening**) and `ARCHITECTURE.md` (API contracts + production boundary).
 
 ---
 
 ## 3. How This Addresses Workflow 1 Challenges
 
-### 3.1 Confidence Thresholds & HITL Review
+This MVP addresses Workflow 1 using a strict safety-first control loop:
 
-The LLM returns a structured object with three fields:
+- **Rule-first deterministic tagging** for repeat vendors (`source=rule`, `confidence=1.0`).
+- **Tenant-scoped classification** for unseen vendors (CoA injected and hard-validated server-side).
+- **Confidence routing** (`AUTO_TAG` / `REVIEW_QUEUE` / `UNKNOWN`) with cold-start tightening.
+- **Learning loop** where reviewer outcomes improve future deterministic coverage.
+- **No silent failures**: invalid/unavailable outputs always route to safe refusal paths.
 
-```json
-{
-  "coa_account_id": "6200",
-  "confidence": 0.91,
-  "reasoning": "Vendor 'aws-marketplace' matches cloud infrastructure patterns; closest account is 6200 (Cloud & Hosting)."
-}
-```
+For full flow details, invariants, and failure semantics, see `ARCHITECTURE.md` sections:
 
-Routing logic (thresholds are per-tenant config knobs):
-
-| Confidence range | Default threshold | Action |
-| :--- | :--- | :--- |
-| `>= AUTO_POST_THRESHOLD` | 0.85 | `AUTO_TAG` — sync to accounting platform |
-| `>= REVIEW_THRESHOLD` | 0.50 | `REVIEW_QUEUE` — surfaced to finance team |
-| `< REVIEW_THRESHOLD` | < 0.50 | `UNKNOWN` — logged, held for manual coding |
-| Invalid schema or account not in CoA | — | `UNKNOWN` — always |
-
-During cold start (no rules, no history), `AUTO_POST_THRESHOLD` is raised to **0.95** to bias toward review over silent errors.
-
-The `reasoning` field is shown to the reviewer in the UI, making it easy to accept or correct the suggestion with context.
-
-### 3.1.1 Deterministic rule matching (MVP spec)
-
-To keep MVP behavior auditable and unambiguous, the deterministic rule engine uses:
-
-- **Vendor key**: `vendor_key = normalize(vendor_raw)` where `normalize()` lowercases, strips punctuation, and collapses whitespace.
-- **Match type**: **exact match only** on `(tenant_id, vendor_key)`.
-- **Precedence**: deterministic rules run before any LLM call. A rule match yields `AUTO_TAG` with `source="rule"` and `confidence=1.0`.
-- **Multiple matches**: not possible under exact-match keying. Regex/substring rules are explicitly out of scope for the MVP.
-
-### 3.2 Per-Tenant CoA
-
-Generic models fail because "Subscriptions" in Tenant A might map to `SaaS Tools (6100)`, while in Tenant B it maps to `COGS — Software (5050)`.
-
-Every request is fully tenant-scoped:
-
-- `tenant_id` is required on every transaction event.
-- The LLM prompt is injected with that tenant's full CoA list.
-- The LLM is explicitly instructed to choose **only** from the provided account IDs.
-- The application validates the returned `coa_account_id` against the tenant CoA loaded at process startup (materialized as an in-memory `set` of valid IDs for fast membership checks) — this is the hard gate. A plausible-sounding account ID that doesn't exist in the tenant's CoA is treated as an invalid response.
-
-**Example CoA injection in prompt** (see §4 for full prompt):
-
-```
-TENANT CHART OF ACCOUNTS:
-- 6100 | SaaS Tools | Software subscriptions and SaaS platform fees
-- 6200 | Cloud & Hosting | Cloud compute, storage, CDN, and hosting costs
-- 7100 | Travel & Accommodation | Flights, hotels, ground transport for business travel
-...
-You MUST return a coa_account_id from the list above. Any other value is invalid.
-```
-
-### 3.3 Cold Start (No Historical Labels)
-
-When a new tenant onboards with no historical rules:
-
-1. Mark the tenant as `cold_start: true` in `data/tenants.json` (see `tenant_b` in the seed config).
-2. The service applies an **effective** auto-post threshold of **0.95** for routing (even if `auto_post_threshold` remains at its nominal value for readability in config).
-3. All classifier suggestions below the effective auto-post threshold go to `REVIEW_QUEUE` (or `UNKNOWN` if below the review threshold), avoiding early silent auto-posts.
-4. Every reviewer decision is recorded and can be promoted to a rule immediately.
-5. As the rule store grows, the auto-tag rate climbs naturally with zero risk of early silent miscoding.
-
-This creates a deliberate trust-building ramp for each tenant.
-
-### 3.4 Learning Loop
-
-When a reviewer accepts or corrects a suggestion, the system records the outcome and optionally promotes it to a deterministic rule:
-
-```
-reviewer_action: { tx_id, final_coa_account_id, vendor_key, prior_suggestion, prior_confidence }
-    │
-    ├── always: write to audit log
-    ├── always: update review queue status
-    └── if promoted: write rule to rule store
-              (tenant_id, vendor_key) → coa_account_id
-```
-
-**Why deterministic rules over RAG or fine-tuning for this MVP:**
-
-- Rules are immediately auditable — a human can read and verify every rule.
-- They are cheap (zero LLM cost for repeat vendors).
-- They are consistent — same vendor always gets the same account.
-- RAG is the logical next step once the correctness gate is validated and we have enough data to build a meaningful retrieval corpus.
-- Fine-tuning is a later-stage optimization; it requires labeled data volume we don't have at MVP.
-
-This creates a measurable improvement loop: as the rule store grows, Auto-Tagging Rate trends up and review queue volume trends down, both trackable per tenant over time.
-
-**Known gap — rule trust asymmetry**: a single reviewer correction immediately becomes a deterministic rule. If the reviewer is wrong, all future transactions for that vendor are silently miscoded — the exact failure mode this system is designed to prevent. Mitigation: every rule carries `created_by`, `created_at`, and `source_tx_id` for full lineage; rule changes are append-only in the audit log; an admin role can review and revert any rule. A future enhancement is a rule confidence threshold requiring N concordant corrections before a rule auto-applies.
-
-> **Implementation note (audit vs rule store)**: rule mutations are recorded as append-only events in the audit log for traceability, while the JSON-backed rule store is treated as the current materialized “latest state” used for deterministic matching.
-
-### 3.5 "I Don't Know" — Zero Silent Errors
-
-Any of the following routes the transaction to `UNKNOWN` or `REVIEW_QUEUE` — never to `AUTO_TAG`:
-
-- Confidence below `REVIEW_THRESHOLD`
-- LLM returns invalid JSON
-- LLM returns a `coa_account_id` not in the tenant's CoA
-- All providers in the fallback chain exhausted (timeout or error on every provider)
-- Missing required transaction fields (`vendor`, `amount`, `tenant_id`)
-- `confidence` value outside `[0.0, 1.0]`
-
-Every outcome is written to the audit log before any further action. The accounting sync adapter is never called unless the routing decision is `AUTO_TAG`.
-
-### 3.6 Long-Tail Vendor Evaluation
-
-Standard vendors (AWS, Uber, Zoom) are easy. The long tail — unusual local vendors, foreign-language merchant names, one-time contractors — is where LLMs are most likely to hallucinate a plausible-but-wrong account.
-
-**Eval strategy:**
-
-1. Maintain a curated dataset of edge-case transactions in `tests/eval/fixtures/edge_cases.json`. Each fixture includes the vendor name, transaction context, correct CoA account, and a difficulty label (`easy` / `long-tail` / `ambiguous`).
-2. Run `eval_runner.py` against this dataset on every prompt change.
-3. Key metrics tracked:
-   - **Precision on auto-tag**: of transactions routed to `AUTO_TAG`, what % had the correct CoA? Target: ≥ 98%.
-   - **Long-tail UNKNOWN rate**: of `long-tail`-labeled fixtures, what % correctly routed to `REVIEW_QUEUE` or `UNKNOWN`? Target: ≥ 90%.
-   - **Confidence calibration**: is a confidence of 0.85 actually right ~85% of the time? (Brier score or reliability diagram.)
-4. A prompt change that drops long-tail UNKNOWN rate below 90% is a regression — block it regardless of overall precision improvement.
+- **2) End-to-End Flow**
+- **3) Architectural Invariants**
+- **6) Failure-Mode Strategy**
 
 ---
 
 ## 4. LLM Prompt Design
+
+> **Source of truth**: the authoritative prompt used at runtime is `app/pipeline/llm_prompt.py`. The snippets below are representative for reviewer readability and may be shortened for documentation.
 
 ### 4.1 System Prompt
 
@@ -339,24 +295,15 @@ Standard vendors (AWS, Uber, Zoom) are easy. The long tail — unusual local ven
 >
 > **Tenant name**: `tenant_name` is loaded from `TenantConfig` (e.g., `data/tenants.json`) keyed by `tenant_id` during prompt construction. It is included for human debuggability; the LLM does not require `tenant_id` to classify correctly.
 
+```text
+You are a financial transaction classifier for a multi-tenant expense platform.
+Return ONLY raw JSON with keys: reasoning, coa_account_id, confidence.
+coa_account_id MUST come from the provided tenant CoA.
+If ambiguous, keep confidence below 0.5; confident matches should be >= 0.85.
+Choose the most specific plausible account; if tie remains, pick lower-risk and lower confidence.
 ```
-You are a financial transaction classifier for a multi-tenant expense management platform.
 
-Your job is to assign each transaction to the correct account in the tenant's Chart of Accounts (CoA).
-
-Rules you must follow:
-1. You MUST return a JSON object with exactly three fields: coa_account_id, confidence, reasoning.
-2. coa_account_id MUST be one of the account IDs listed in the TENANT CHART OF ACCOUNTS below. Any other value is invalid.
-3. confidence MUST be a float between 0.0 and 1.0 representing how certain you are.
-4. If you are not confident (e.g., the vendor is ambiguous or could fit multiple accounts), return a lower confidence value. Do NOT guess at high confidence.
-5. reasoning MUST be a single sentence explaining your choice.
-6. Return ONLY the JSON object. No preamble, no markdown, no explanation outside the JSON.
-
-TENANT CHART OF ACCOUNTS:
-{coa_list}
-
-TENANT NAME: {tenant_name}
-```
+For the exact live prompt text (including formatting and all guardrails), see `app/pipeline/llm_prompt.py`.
 
 ### 4.2 User Prompt (per transaction)
 
@@ -382,7 +329,7 @@ Respond with ONLY a JSON object: {"coa_account_id": "...", "confidence": 0.0, "r
 [
   {
     "vendor": "aws-marketplace",
-    "amount": 1240.00,
+    "amount": 1240.0,
     "currency": "USD",
     "coa_account_id": "6200",
     "coa_name": "Cloud & Hosting",
@@ -390,7 +337,7 @@ Respond with ONLY a JSON object: {"coa_account_id": "...", "confidence": 0.0, "r
   },
   {
     "vendor": "grab-sg-0023",
-    "amount": 18.50,
+    "amount": 18.5,
     "currency": "SGD",
     "coa_account_id": "7200",
     "coa_name": "Local Transport",
@@ -399,7 +346,7 @@ Respond with ONLY a JSON object: {"coa_account_id": "...", "confidence": 0.0, "r
 ]
 ```
 
-Up to 5 examples are injected, selected randomly from the tenant's historical confirmed tags for the MVP. In production, this would be replaced by retrieval-based selection (most semantically similar vendor category), which improves long-tail performance — see §9.
+Up to 5 examples are injected from tenant-confirmed history using deterministic seeded sampling (`sha256(tx_id)`) for reproducibility in tests/demos. In production, this would be replaced by retrieval-based selection (most semantically similar vendor category), which improves long-tail performance — see §9.
 
 **MVP few-shot selection spec**:
 
@@ -408,7 +355,7 @@ Up to 5 examples are injected, selected randomly from the tenant's historical co
 - **Exclusions**:
   - exclude examples whose normalized vendor key equals the current transaction’s vendor key
   - exclude malformed/incomplete examples
-- **Reproducibility (recommended)**: seed sampling with a stable seed (e.g., `hash(tx_id)`), so demo output is deterministic across runs.
+- **Reproducibility (implemented)**: sampling uses a stable `sha256(tx_id)`-derived seed so demo output is deterministic across runs and Python processes.
 
 ### 4.4 Expected LLM Response
 
@@ -489,22 +436,15 @@ class VendorRule(BaseModel):
 
 ## 6. Failure Modes & Edge Cases
 
-| Failure condition | Detection point | Handling |
-| :--- | :--- | :--- |
-| LLM 4xx (content filter, prompt too long) | `llm_classifier.py` try/catch | Log raw error; route to `UNKNOWN` immediately; **do not fall back** — the same prompt will fail on the next provider for the same reason, and would leak the request to a second vendor unnecessarily |
-| LLM 429 (rate limited) | `llm_classifier.py` try/catch | Exponential backoff up to 2 retries on the **same provider**; only fall back to next provider if retries are exhausted; log each retry with wait duration |
-| LLM 5xx / connection error | `llm_classifier.py` try/catch | Try next provider in fallback chain immediately (no retry on same provider); route to `UNKNOWN` only if all providers return errors; log each failure with status code |
-| LLM API timeout | `llm_classifier.py` try/catch | Try next provider in fallback chain; route to `UNKNOWN` only if all providers time out; log each attempt and latency |
-| End-to-end latency budget exceeded | `llm_classifier.py` deadline guard | A 15-second wall-clock budget covers the entire fallback chain; if the deadline is reached before a valid response, route to `UNKNOWN` regardless of remaining providers — prevents multi-timeout cascades (~90s worst case) from blocking the pipeline |
-| LLM returns invalid JSON | `validator.py` JSON parse | Route to `UNKNOWN`; log raw response |
-| LLM returns account not in tenant CoA | `validator.py` CoA membership check | Route to `UNKNOWN`; log the hallucinated ID |
-| `confidence` outside `[0.0, 1.0]` | Pydantic field validator | Route to `UNKNOWN` |
-| Confidence exactly at threshold boundary | `router.py` | `>= AUTO_POST_THRESHOLD` auto-tags; boundary is inclusive on the upper route |
-| Empty or missing vendor string | `preprocessor.py` | Route to `UNKNOWN`; cannot normalize |
-| Tenant CoA list exceeds token budget | `llm_classifier.py` | Truncate to top 50 accounts by usage frequency; log warning. Note: if the correct account falls outside the top 50, the LLM cannot select it — mitigated by instructing the LLM to return low confidence when no listed account fits, which routes the transaction to `REVIEW_QUEUE` rather than miscoding it. |
-| Duplicate transaction (same `idempotency_key`) | `main.py` before pipeline | Return cached result; skip reprocessing |
-| Reviewer corrects to an account not in CoA | `review_queue.py` endpoint | Reject with 422; return valid account list |
-| Tenant renames or deletes a CoA account that an existing rule references | `rule_store.py` on CoA update event | Re-validate all rules against the updated CoA; flag stale rules for reviewer confirmation before they can auto-tag again |
+Full failure-mode policy is maintained in `ARCHITECTURE.md` (**6) Failure-Mode Strategy**).
+
+Critical MVP behavior to remember:
+
+- **Provider 4xx** -> no cross-provider fallback; safe refusal path.
+- **Provider 429 / 5xx / timeout** -> bounded retry/fallback, then safe refusal if exhausted.
+- **Invalid output or out-of-CoA account** -> `UNKNOWN`.
+- **Replay conflicts** (`idempotency_key` or review resolve replay payload mismatch) -> `409`.
+- **Low confidence** -> `REVIEW_QUEUE` / `UNKNOWN`, never forced `AUTO_TAG`.
 
 ---
 
@@ -520,7 +460,7 @@ Located at `tests/eval/fixtures/edge_cases.json`. Structure:
     "tx_id": "eval_001",
     "tenant_id": "tenant_a",
     "vendor_raw": "PTTEP THAILAND FUEL 0049",
-    "amount": 340.00,
+    "amount": 340.0,
     "currency": "THB",
     "expected_status": "REVIEW_QUEUE",
     "expected_coa_account_id": null,
@@ -532,13 +472,13 @@ Located at `tests/eval/fixtures/edge_cases.json`. Structure:
 
 ### 7.2 Metrics
 
-| Metric | Definition | Target |
-| :--- | :--- | :--- |
-| **Auto-tag precision** | Correct CoA / total auto-tagged (measured against `edge_cases.json` fixture set, not live traffic — production ground truth requires human-reviewed labels) | ≥ 98% on fixture set |
-| **Long-tail UNKNOWN rate** | `long-tail` fixtures routed to REVIEW or UNKNOWN / total `long-tail` | ≥ 90% |
-| **Review rate** | Transactions routed to REVIEW / total | Informational (tracks threshold calibration) |
-| **Confidence calibration** | Is conf=0.85 right ~85% of the time? | Brier score ≤ 0.05 |
-| **Rule coverage** | Transactions handled by deterministic rule / total | Trending up over time |
+| Metric                     | Definition                                                                                                                                                  | Target                                       |
+| :------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------- |
+| **Auto-tag precision**     | Correct CoA / total auto-tagged (measured against `edge_cases.json` fixture set, not live traffic — production ground truth requires human-reviewed labels) | ≥ 98% on fixture set                         |
+| **Long-tail UNKNOWN rate** | `long-tail` fixtures routed to REVIEW or UNKNOWN / total `long-tail`                                                                                        | ≥ 90%                                        |
+| **Review rate**            | Transactions routed to REVIEW / total                                                                                                                       | Informational (tracks threshold calibration) |
+| **Confidence calibration** | Is conf=0.85 right ~85% of the time?                                                                                                                        | Brier score ≤ 0.05                           |
+| **Rule coverage**          | Transactions handled by deterministic rule / total                                                                                                          | Trending up over time                        |
 
 **Known gap — LLM confidence calibration**: LLM self-reported confidence is not natively well-calibrated; a model returning 0.85 is not reliably correct 85% of the time. Brier score ≤ 0.05 is the target eval metric. If calibration drifts in production, a post-hoc calibration layer (Platt scaling or isotonic regression, fit on the eval fixture set) can be inserted between Step 5 (Output Validation) and Step 6 (Confidence Router) without changing the surrounding architecture.
 
@@ -549,6 +489,7 @@ A prompt change, model upgrade, or threshold adjustment must pass the eval harne
 - Auto-tag precision must not drop below 98%.
 - Long-tail UNKNOWN rate must not drop below 90%.
 - Any regression on either metric blocks the change, even if overall accuracy improves.
+- Release governance: these checks are expected to run in CI; production prompt/model changes should not deploy unless the gate remains green.
 
 ### 7.4 Running Evals
 
@@ -585,29 +526,29 @@ Note: `tenant_b` is configured with `cold_start: true`, which raises the effecti
 
 ## 8. Architectural & Technology Choices
 
-| Layer | Choice | Rationale |
-| :--- | :--- | :--- |
-| Framework | FastAPI | Async-native, schema-first with Pydantic, minimal boilerplate, easy to test |
-| Validation | Pydantic v2 | Strict schema enforcement at I/O boundaries; catches LLM output errors before routing |
-| Primary LLM | Google Gemini (`GOOGLE_API_KEY`) | Single key covers both transaction classification and Google Cloud OCR services (Document AI / Vision); reduces credential sprawl |
-| Fallback LLM | Anthropic Claude (`CLAUDE_API_KEY`) | Invoked automatically if Gemini errors or times out; strong JSON compliance and instruction-following |
-| Second Fallback LLM | OpenAI GPT-4o (`OPENAI_API_KEY`) | Final safety net if both Gemini and Claude are unavailable; ensures the pipeline never hard-fails on a single provider outage |
-| LLM Abstraction | LiteLLM | Standardizes API calls across all three providers using the OpenAI request format; the fallback chain is ~5 lines of code rather than three separate SDKs with divergent timeout and error handling |
-| Storage (MVP) | SQLite (`data/runtime/state.db`) + JSON seed files | Durable-enough local persistence for audit/idempotency/review/few-shot examples without standing up Postgres |
-| Storage (production) | Postgres + Redis + append-only audit table | See §9 |
-| Vendor normalization | Regex + `str.lower()` + whitespace collapse | Deterministic, fast, no external dependency |
+| Layer                | Choice                                             | Rationale                                                                                                                                                                                           |
+| :------------------- | :------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Framework            | FastAPI                                            | Async-native, schema-first with Pydantic, minimal boilerplate, easy to test                                                                                                                         |
+| Validation           | Pydantic v2                                        | Strict schema enforcement at I/O boundaries; catches LLM output errors before routing                                                                                                               |
+| Primary LLM          | Google Gemini (`GOOGLE_API_KEY`)                   | Single key covers both transaction classification and Google Cloud OCR services (Document AI / Vision); reduces credential sprawl                                                                   |
+| Fallback LLM         | Anthropic Claude (`CLAUDE_API_KEY`)                | Invoked automatically if Gemini errors or times out; strong JSON compliance and instruction-following                                                                                               |
+| Second Fallback LLM  | OpenAI GPT-4o (`OPENAI_API_KEY`)                   | Final safety net if both Gemini and Claude are unavailable; ensures the pipeline never hard-fails on a single provider outage                                                                       |
+| LLM Abstraction      | LiteLLM                                            | Standardizes API calls across all three providers using the OpenAI request format; the fallback chain is ~5 lines of code rather than three separate SDKs with divergent timeout and error handling |
+| Storage (MVP)        | SQLite (`data/runtime/state.db`) + JSON seed files | Durable-enough local persistence for audit/idempotency/review/few-shot examples without standing up Postgres                                                                                        |
+| Storage (production) | Postgres + Redis + append-only audit table         | See §9                                                                                                                                                                                              |
+| Vendor normalization | Regex + `str.lower()` + whitespace collapse        | Deterministic, fast, no external dependency                                                                                                                                                         |
 
-**On JSON mode vs. function calling**: JSON mode was chosen over function calling because the output schema is simple (3 fields) and JSON mode produces fewer refusals on edge-case inputs. If the schema grows to include tax codes and tracking categories, function calling is the better fit.
+Design rationale and trade-off depth (provider semantics, abstraction boundaries, concurrency constraints) are documented in `ARCHITECTURE.md` sections:
 
-**On model choice and fallback chain**: Gemini is the preferred primary LLM — a single `GOOGLE_API_KEY` also covers Google Cloud services (Document AI for invoice OCR, Vision API for receipt parsing), reducing credential sprawl. Claude is the first fallback, OpenAI GPT-4o the second.
-
-**The chain is dynamic**: `llm_classifier.py` checks the environment at startup for available keys and builds the provider list in order. If an `APIConnectionError` or `Timeout` occurs, it falls back to the next available provider seamlessly — zero downtime for transaction classification, and no hard failure if a provider is temporarily unavailable.
-
-**LiteLLM is used for abstraction**: rather than writing three separate SDK integrations with divergent error types and JSON mode implementations, LiteLLM standardizes all calls to the OpenAI request format. The fallback chain is ~5 lines of code. MVP scope note: if running with a single key, the chain degrades gracefully to that provider only — the demo works with just `OPENAI_API_KEY`.
+- **4) System Components**
+- **6) Failure-Mode Strategy**
+- **7) MVP vs Production Boundary**
 
 ---
 
 ## 9. Production-Readiness Considerations
+
+Canonical production architecture direction is in `ARCHITECTURE.md` (**7) MVP vs Production Boundary** and **8) Open Production Architecture Questions**.
 
 ### Must-haves before production
 
@@ -621,11 +562,14 @@ Note: `tenant_b` is configured with `cold_start: true`, which raises the effecti
   - UNKNOWN rate + top unknown vendors (actionable: which vendors need rules?)
   - LLM latency p50/p95
   - Token usage per request (cost control)
+  - Decision-path tracing (`rule` vs `llm` vs `unknown`) with provider attribution
+  - Alerting on drift thresholds (for example UNKNOWN spikes or Brier score degradation)
 - **Eval harness**: run on every prompt or model change (see §7).
 - **Tenant isolation**: every data access (CoA, rules, audit log, review queue) is scoped by `tenant_id` with server-side enforcement. A tenant must never be able to read or influence another tenant's data, rules, or audit trail — enforced at the repository layer, not just the API layer.
+- **Review resolve route hardening (HIGH before external multi-tenant rollout)**: current resolve route carries `tenant_id` in request body (`POST /review-queue/{tx_id}/resolve`). Before real multi-tenant exposure, move tenant scope into the path (`POST /tenants/{tenant_id}/review-queue/{tx_id}/resolve`) and keep server-side tenant ownership checks.
 - **Rate limiting**: protect the LLM call path from burst traffic; queue overflow to REVIEW rather than dropping.
 - **Per-tenant LLM spend cap**: a configurable monthly token budget per tenant; transactions arriving after the cap is reached are routed to `REVIEW_QUEUE` rather than triggering LLM calls, preventing runaway costs for high-volume or misconfigured tenants.
-- **Confidence calibration operations**: re-run the eval harness at least monthly; if Brier score rises above `0.08`, block threshold/model changes and run a recalibration pass (Platt scaling or isotonic regression) before release.
+- **Confidence calibration operations**: run eval harness as a weekly CI job (non-blocking) and assign ownership to ML/platform on-call. If Brier score rises above `0.08`, block threshold/model changes and run a recalibration pass (Platt scaling or isotonic regression) before release.
 
 ### Next-step architecture (post-MVP)
 
@@ -735,13 +679,13 @@ This output demonstrates the full safety story: rule-based auto-tag, LLM with me
 
 ### Key API endpoints
 
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/transactions/tag` | Submit a transaction for tagging |
-| `GET` | `/review-queue/{tenant_id}` | List pending review items |
-| `POST` | `/review-queue/{tx_id}/resolve` | Accept or correct a suggestion |
-| `GET` | `/audit-log/{tenant_id}` | View full audit trail |
-| `GET` | `/rules/{tenant_id}` | View current vendor rule store |
+| Method | Endpoint                        | Description                      |
+| :----- | :------------------------------ | :------------------------------- |
+| `POST` | `/transactions/tag`             | Submit a transaction for tagging |
+| `GET`  | `/review-queue/{tenant_id}`     | List pending review items        |
+| `POST` | `/review-queue/{tx_id}/resolve` | Accept or correct a suggestion   |
+| `GET`  | `/audit-log/{tenant_id}`        | View full audit trail            |
+| `GET`  | `/rules/{tenant_id}`            | View current vendor rule store   |
 
 ---
 
@@ -751,7 +695,7 @@ This output demonstrates the full safety story: rule-based auto-tag, LLM with me
 - **Transaction event stream**: Simulated by the `POST /transactions/tag` HTTP endpoint and the demo script. In production this would be a Kafka or SQS consumer.
 - **Accounting platform sync**: Represented by a mock adapter that logs the payload. Real integration (Xero, QuickBooks, NetSuite) is an adapter swap.
 - **Vendor rules are keyed by normalized vendor string**: Lowercased, whitespace collapsed, punctuation stripped. E.g., `"AWS Marketplace, Inc."` → `"aws marketplace inc"`. Fuzzy matching is a next-step improvement.
-- **Few-shot examples are sampled from confirmed tenant history**: For the MVP, up to 5 examples are selected randomly. In production, retrieval-based selection (most similar vendor category) is better.
+- **Few-shot examples are sampled from confirmed tenant history**: For the MVP, up to 5 examples are selected via deterministic seeded sampling (`sha256(tx_id)`). In production, retrieval-based selection (most similar vendor category) is better.
 - **Storage is local JSON seed files + SQLite runtime state**: sufficient for a take-home MVP demo; production storage choices are documented in §9.
 - **Deployment mode for this MVP is single-process only**: in-process `RLock` + SQLite file locking protects correctness for local/demo runs, but is not a substitute for distributed concurrency control across multiple workers/replicas.
 - **Single primary LLM call per transaction**: fallback providers are only invoked if the primary errors or times out. For the MVP's narrow scope (CoA tagging only), a single well-structured prompt is sufficient; in the worst case (all prior providers fail) up to 3 calls are made, each with the same prompt and schema.
@@ -762,11 +706,4 @@ This output demonstrates the full safety story: rule-based auto-tag, LLM with me
 
 ## 12. Open Questions for Production Scaling (Post-MVP)
 
-If this MVP were moving to production, I would align with product, security, and platform teams on the following decisions before rollout:
-
-1. **Data isolation boundaries**: Are we permitted to cross-pollinate anonymized retrieval embeddings across tenants to improve cold-start performance globally, or do compliance obligations require strictly siloed retrieval spaces per tenant?
-2. **Downstream sync burst handling**: During month-end close spikes, what is the queuing and retry strategy (for example SQS/Kafka + DLQ + exponential backoff) for accounting platform APIs (Xero/NetSuite/QuickBooks) that enforce tight rate limits?
-3. **Authorization vs settlement lifecycle**: Should classification run at authorization, settlement, or both? If merchant descriptors change at settlement, do we re-evaluate and can settlement overwrite a prior human-reviewed decision?
-4. **Review queue concurrency model**: When multiple accountants resolve items concurrently, what optimistic-locking contract should the API enforce (for example version checks with `409 Conflict`) to prevent double-resolution races?
-5. **Multi-dimensional accounting constraints**: When tax codes and tracking categories are introduced, are there strict dependencies between CoA accounts and allowable metadata values? If yes, prompt constraints and output validation should enforce relational validity, not just field-level schema validity.
-
+Canonical open production architecture questions are maintained in `ARCHITECTURE.md` under **8) Open Production Architecture Questions**.

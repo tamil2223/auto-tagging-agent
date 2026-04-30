@@ -40,6 +40,5 @@ dist/
 .idea/
 .vscode/
 
-docs/
 .cursor/
 data/runtime/
