@@ -233,6 +233,23 @@ def test_classify_transaction_no_llm_pttep_is_conservatively_low_confidence() ->
     assert output.confidence == 0.31
 
 
+def test_classify_transaction_no_llm_pttep_with_empty_coa_returns_safe_unknown() -> None:
+    tx = Transaction(
+        tx_id="tx_det_pttep_empty",
+        tenant_id="tenant_z",
+        vendor_raw="PTTEP THAILAND FUEL 0049",
+        amount="10.00",
+        currency="THB",
+        date="2026-04-30",
+        transaction_type="card",
+        idempotency_key="idem_det_pttep_empty",
+    )
+    output = classify_transaction_no_llm(tx, [])
+
+    assert output.coa_account_id == ""
+    assert output.confidence == 0.0
+
+
 def test_classify_transaction_no_llm_uses_coa_semantics_not_hardcoded_ids() -> None:
     tenant_c_coa = [
         CoAAccount(account_id="c-001", name="Cloud Infrastructure", description="Cloud hosting and compute"),

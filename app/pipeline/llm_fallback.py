@@ -210,6 +210,13 @@ def classify_transaction_no_llm(
     Returns:
         A structured classification output compatible with the validator/router pipeline.
     """
+    if not tenant_coa:
+        return LLMClassificationOutput(
+            coa_account_id="",
+            confidence=0.0,
+            reasoning="Tenant chart of accounts is empty; cannot classify deterministically.",
+        )
+
     vendor_lower = transaction.vendor_raw.lower()
     if "pttep" in vendor_lower:
         sorted_ids = sorted({account.account_id for account in tenant_coa})
@@ -217,13 +224,6 @@ def classify_transaction_no_llm(
             coa_account_id=sorted_ids[0],
             confidence=0.31,
             reasoning="Vendor appears fuel/energy-adjacent and should be routed conservatively.",
-        )
-
-    if not tenant_coa:
-        return LLMClassificationOutput(
-            coa_account_id="",
-            confidence=0.0,
-            reasoning="Tenant chart of accounts is empty; cannot classify deterministically.",
         )
 
     scores = _score_tenant_coa_candidates(vendor_lower, tenant_coa)

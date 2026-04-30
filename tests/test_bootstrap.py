@@ -352,6 +352,48 @@ def test_resolve_review_item_is_idempotent_after_first_resolution() -> None:
     assert first.json() == second.json()
 
 
+def test_resolve_review_item_rejects_conflicting_replay_payload() -> None:
+    client = TestClient(app)
+    tx_id = _unique_key("tx_009c")
+    vendor_raw = f"Grab SG {_unique_key('replay_conflict')}"
+    payload = {
+        "tx_id": tx_id,
+        "tenant_id": "tenant_a",
+        "vendor_raw": vendor_raw,
+        "amount": "18.50",
+        "currency": "SGD",
+        "date": "2026-04-29",
+        "transaction_type": "card",
+        "ocr_text": None,
+        "idempotency_key": _unique_key("idem_009c"),
+    }
+    client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
+
+    first = client.post(
+        f"/review-queue/{tx_id}/resolve",
+        json={
+            "tenant_id": "tenant_a",
+            "action": "correct",
+            "final_coa_account_id": "6100",
+            "reviewer_id": "reviewer_conflict",
+        },
+        headers=_headers("tenant_a"),
+    )
+    conflicting_second = client.post(
+        f"/review-queue/{tx_id}/resolve",
+        json={
+            "tenant_id": "tenant_a",
+            "action": "accept",
+            "final_coa_account_id": "7200",
+            "reviewer_id": "reviewer_conflict_2",
+        },
+        headers=_headers("tenant_a"),
+    )
+
+    assert first.status_code == 200
+    assert conflicting_second.status_code == 409
+
+
 def test_reviewer_correction_promotes_vendor_rule_for_next_transaction() -> None:
     client = TestClient(app)
     vendor_raw = f"Grab SG {_unique_key('vendor')}"

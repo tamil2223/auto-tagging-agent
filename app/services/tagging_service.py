@@ -59,6 +59,33 @@ def _transaction_fingerprint(transaction: Transaction) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _validate_resolution_replay_payload(
+    *,
+    existing_resolution: ReviewResolveResponse,
+    request: ReviewResolveRequest,
+) -> None:
+    """Validates that repeated resolve calls use the same effective payload.
+
+    Args:
+        existing_resolution: Previously persisted resolution response for (tenant_id, tx_id).
+        request: Incoming resolve request being replayed.
+
+    Raises:
+        HTTPException: If the replay request conflicts with the already-resolved payload.
+    """
+    existing_coa = existing_resolution.result.coa_account_id
+    requested_action = request.action
+    existing_action = "correct" if existing_resolution.rule_created else "accept"
+    if existing_coa != request.final_coa_account_id or existing_action != requested_action:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Review item already resolved with a different payload; "
+                "replay must use the same action and final_coa_account_id."
+            ),
+        )
+
+
 class TaggingService:
     """Application use-case: tag transactions and resolve human review."""
 
@@ -299,6 +326,10 @@ class TaggingService:
         with self._processing_lock:
             existing_resolution = self._review_queue_store.get_resolution(request.tenant_id, tx_id)
             if existing_resolution is not None:
+                _validate_resolution_replay_payload(
+                    existing_resolution=existing_resolution,
+                    request=request,
+                )
                 return existing_resolution
 
             queued_item = self._review_queue_store.resolve(request.tenant_id, tx_id)
