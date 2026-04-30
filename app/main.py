@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,6 +60,31 @@ for configured_tenant_id, tenant_cfg in app_config.tenants.items():
 
 rule_store = RuleStore(APP_ROOT, rules_paths, coa_ids_by_tenant)
 llm_classifier = LLMClassifier()
+
+
+@dataclass(frozen=True)
+class TenantRoutingThresholds:
+    """Represents effective confidence routing thresholds for one tenant."""
+
+    review_threshold: float
+    auto_post_threshold: float
+
+
+def _resolve_tenant_routing_thresholds(tenant_cfg) -> TenantRoutingThresholds:
+    """Computes routing thresholds, applying cold-start auto-post tightening when enabled.
+
+    Args:
+        tenant_cfg: Loaded tenant configuration model.
+
+    Returns:
+        Effective routing thresholds used by the confidence router.
+    """
+    cold_start_auto_post = 0.95
+    auto_post = cold_start_auto_post if tenant_cfg.cold_start else tenant_cfg.auto_post_threshold
+    return TenantRoutingThresholds(
+        review_threshold=tenant_cfg.review_threshold,
+        auto_post_threshold=auto_post,
+    )
 
 
 def _transaction_fingerprint(transaction: Transaction) -> str:
@@ -123,6 +149,7 @@ def tag_transaction(
             tenant_id = transaction.tenant_id
             tenant_coa = coa_by_tenant[tenant_id]
             tenant_config = app_config.tenants[tenant_id]
+            routing_thresholds = _resolve_tenant_routing_thresholds(tenant_config)
             classification_result = llm_classifier.classify(
                 transaction,
                 tenant_coa,
@@ -173,8 +200,8 @@ def tag_transaction(
                 else:
                     status = route_by_confidence(
                         classification.confidence,
-                        review_threshold=tenant_config.review_threshold,
-                        auto_post_threshold=tenant_config.auto_post_threshold,
+                        review_threshold=routing_thresholds.review_threshold,
+                        auto_post_threshold=routing_thresholds.auto_post_threshold,
                     )
                     result = TaggingResult(
                         tx_id=transaction.tx_id,
@@ -186,11 +213,11 @@ def tag_transaction(
                         reasoning=classification.reasoning,
                         timestamp=datetime.now(timezone.utc),
                         idempotency_key=transaction.idempotency_key,
-                            provider_name=classification_result.provider_name,
-                            latency_ms=classification_result.latency_ms,
-                            prompt_tokens=classification_result.prompt_tokens,
-                            completion_tokens=classification_result.completion_tokens,
-                            total_tokens=classification_result.total_tokens,
+                        provider_name=classification_result.provider_name,
+                        latency_ms=classification_result.latency_ms,
+                        prompt_tokens=classification_result.prompt_tokens,
+                        completion_tokens=classification_result.completion_tokens,
+                        total_tokens=classification_result.total_tokens,
                     )
                     audit_store.append(result)
                     if status == "AUTO_TAG":

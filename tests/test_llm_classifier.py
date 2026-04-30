@@ -6,6 +6,7 @@ from app.models import CoAAccount, Transaction
 from app.pipeline.llm_classifier import (  # pylint: disable=no-name-in-module
     LLMClassifier,
     ProviderConfig,
+    classify_transaction_no_llm,
     sanitize_ocr_text,
 )
 
@@ -184,3 +185,97 @@ def test_llm_classifier_injects_few_shot_examples_into_prompt() -> None:
     user_message = next(message for message in captured_messages if message["role"] == "user")
     assert '"vendor": "aws-marketplace"' in user_message["content"]
     assert '"vendor": "grab-sg-0023"' in user_message["content"]
+
+
+def _tenant_b_coa() -> list[CoAAccount]:
+    return [
+        CoAAccount(account_id="5050", name="COGS - Software", description="Software costs booked under cost of goods sold"),
+        CoAAccount(account_id="7100", name="Travel & Accommodation", description="Flights, hotels, and related travel expenses"),
+        CoAAccount(account_id="7300", name="Professional Services", description="Contractors, legal, and consulting fees"),
+    ]
+
+
+def test_classify_transaction_no_llm_maps_aws_to_tenant_b_cogs_account() -> None:
+    tx = Transaction(
+        tx_id="tx_det_aws_b",
+        tenant_id="tenant_b",
+        vendor_raw="AWS Marketplace",
+        amount="10.00",
+        currency="USD",
+        date="2026-04-30",
+        transaction_type="card",
+        idempotency_key="idem_det_aws_b",
+    )
+    output = classify_transaction_no_llm(tx, _tenant_b_coa())
+
+    assert output.coa_account_id == "5050"
+    assert output.confidence >= 0.90
+
+
+def test_classify_transaction_no_llm_maps_grab_to_tenant_b_travel_account() -> None:
+    tx = Transaction(
+        tx_id="tx_det_grab_b",
+        tenant_id="tenant_b",
+        vendor_raw="Grab SG 1234",
+        amount="10.00",
+        currency="SGD",
+        date="2026-04-30",
+        transaction_type="card",
+        idempotency_key="idem_det_grab_b",
+    )
+    output = classify_transaction_no_llm(tx, _tenant_b_coa())
+
+    assert output.coa_account_id == "7100"
+    assert 0.50 <= output.confidence < 0.85
+
+
+def test_classify_transaction_no_llm_pttep_is_conservatively_low_confidence() -> None:
+    tx = Transaction(
+        tx_id="tx_det_pttep",
+        tenant_id="tenant_b",
+        vendor_raw="PTTEP THAILAND FUEL 0049",
+        amount="10.00",
+        currency="THB",
+        date="2026-04-30",
+        transaction_type="card",
+        idempotency_key="idem_det_pttep",
+    )
+    output = classify_transaction_no_llm(tx, _tenant_b_coa())
+
+    assert output.coa_account_id == "5050"
+    assert output.confidence == 0.31
+
+
+def test_classify_transaction_no_llm_uses_coa_semantics_not_hardcoded_ids() -> None:
+    tenant_c_coa = [
+        CoAAccount(account_id="c-001", name="Cloud Infrastructure", description="Cloud hosting and compute"),
+        CoAAccount(account_id="c-002", name="Business Travel", description="Travel and accommodation costs"),
+    ]
+    aws_tx = Transaction(
+        tx_id="tx_det_aws_c",
+        tenant_id="tenant_c",
+        vendor_raw="AWS Marketplace",
+        amount="10.00",
+        currency="USD",
+        date="2026-04-30",
+        transaction_type="card",
+        idempotency_key="idem_det_aws_c",
+    )
+    grab_tx = Transaction(
+        tx_id="tx_det_grab_c",
+        tenant_id="tenant_c",
+        vendor_raw="Grab SG 8899",
+        amount="16.00",
+        currency="SGD",
+        date="2026-04-30",
+        transaction_type="card",
+        idempotency_key="idem_det_grab_c",
+    )
+
+    aws_output = classify_transaction_no_llm(aws_tx, tenant_c_coa)
+    grab_output = classify_transaction_no_llm(grab_tx, tenant_c_coa)
+
+    assert aws_output.coa_account_id == "c-001"
+    assert aws_output.confidence >= 0.90
+    assert grab_output.coa_account_id == "c-002"
+    assert 0.50 <= grab_output.confidence < 0.85

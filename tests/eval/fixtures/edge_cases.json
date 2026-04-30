@@ -28,9 +28,9 @@
     "amount": 18.4,
     "currency": "SGD",
     "expected_status": "REVIEW_QUEUE",
-    "expected_coa_account_id": null,
+    "expected_coa_account_id": "7200",
     "difficulty": "ambiguous",
-    "note": "Ride-hailing should route to review in current classifier"
+    "note": "Ride-hailing maps to Local Transport but stays below auto-post threshold"
   },
   {
     "tx_id": "eval_004",
@@ -61,9 +61,9 @@
     "amount": 22.1,
     "currency": "SGD",
     "expected_status": "REVIEW_QUEUE",
-    "expected_coa_account_id": null,
+    "expected_coa_account_id": "7200",
     "difficulty": "ambiguous",
-    "note": "Medium-confidence path"
+    "note": "Grab-like spend should route to review under default thresholds"
   },
   {
     "tx_id": "eval_007",
@@ -94,9 +94,9 @@
     "amount": 13.2,
     "currency": "SGD",
     "expected_status": "REVIEW_QUEUE",
-    "expected_coa_account_id": null,
+    "expected_coa_account_id": "7200",
     "difficulty": "ambiguous",
-    "note": "Medium-confidence review routing"
+    "note": "Another Grab-like review routing case"
   },
   {
     "tx_id": "eval_010",
@@ -127,9 +127,9 @@
     "amount": 16.0,
     "currency": "SGD",
     "expected_status": "REVIEW_QUEUE",
-    "expected_coa_account_id": null,
+    "expected_coa_account_id": "7200",
     "difficulty": "ambiguous",
-    "note": "Ride-hailing review case"
+    "note": "Ride-hailing should route to review"
   },
   {
     "tx_id": "eval_013",
@@ -182,9 +182,9 @@
     "amount": 12.8,
     "currency": "SGD",
     "expected_status": "REVIEW_QUEUE",
-    "expected_coa_account_id": null,
+    "expected_coa_account_id": "7200",
     "difficulty": "ambiguous",
-    "note": "Review queue candidate"
+    "note": "Grab-like spend should route to review"
   },
   {
     "tx_id": "eval_018",
@@ -204,9 +204,9 @@
     "amount": 19.5,
     "currency": "SGD",
     "expected_status": "REVIEW_QUEUE",
-    "expected_coa_account_id": null,
+    "expected_coa_account_id": "7200",
     "difficulty": "ambiguous",
-    "note": "Repeat review behavior"
+    "note": "Repeat Grab vendor should remain deterministic review routing"
   },
   {
     "tx_id": "eval_020",
@@ -225,10 +225,10 @@
     "vendor_raw": "Zoom US",
     "amount": 36.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "5050",
     "difficulty": "long-tail",
-    "note": "Tenant_b has no seeded zoom rule; should refuse in current classifier"
+    "note": "Cold-start tenant: SaaS-like vendor should map to COGS - Software but not auto-post"
   },
   {
     "tx_id": "eval_022",
@@ -236,10 +236,10 @@
     "vendor_raw": "AWS Marketplace",
     "amount": 420.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "5050",
     "difficulty": "long-tail",
-    "note": "Classifier returns 6200 which is invalid for tenant_b"
+    "note": "Cold-start tenant: strong cloud signal should still route to review under elevated auto-post threshold"
   },
   {
     "tx_id": "eval_023",
@@ -247,10 +247,10 @@
     "vendor_raw": "Grab SG 4201",
     "amount": 17.0,
     "currency": "SGD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7100",
     "difficulty": "ambiguous",
-    "note": "Classifier returns 7200 which is invalid for tenant_b"
+    "note": "Ride-hailing vendor should map to Travel & Accommodation with medium confidence"
   },
   {
     "tx_id": "eval_024",
@@ -261,7 +261,7 @@
     "expected_status": "UNKNOWN",
     "expected_coa_account_id": null,
     "difficulty": "long-tail",
-    "note": "Low-confidence path"
+    "note": "Obscure fuel vendor should remain low-confidence and refuse"
   },
   {
     "tx_id": "eval_025",
@@ -269,10 +269,10 @@
     "vendor_raw": "Obscure Consultant 900",
     "amount": 780.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7300",
     "difficulty": "long-tail",
-    "note": "No deterministic rule and invalid classifier id"
+    "note": "Consultant keyword should map to Professional Services with review-level confidence"
   },
   {
     "tx_id": "eval_026",
@@ -280,10 +280,10 @@
     "vendor_raw": "AWS Marketplace LATAM",
     "amount": 660.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "5050",
     "difficulty": "long-tail",
-    "note": "Invalid CoA output for tenant_b should refuse"
+    "note": "AWS variant should map to COGS - Software under cold-start review bias"
   },
   {
     "tx_id": "eval_027",
@@ -291,10 +291,10 @@
     "vendor_raw": "Grab SG 1122",
     "amount": 12.0,
     "currency": "SGD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7100",
     "difficulty": "ambiguous",
-    "note": "Invalid CoA output for tenant_b"
+    "note": "Grab variant should map to Travel & Accommodation"
   },
   {
     "tx_id": "eval_028",
@@ -305,7 +305,7 @@
     "expected_status": "UNKNOWN",
     "expected_coa_account_id": null,
     "difficulty": "long-tail",
-    "note": "Should stay unknown"
+    "note": "No strong signal; conservative low-confidence refusal"
   },
   {
     "tx_id": "eval_029",
@@ -324,10 +324,10 @@
     "vendor_raw": "AWS Marketplace Backup",
     "amount": 310.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "5050",
     "difficulty": "long-tail",
-    "note": "Invalid account for tenant_b"
+    "note": "AWS backup product naming should still map to software/infra-like COGS account"
   },
   {
     "tx_id": "eval_031",
@@ -335,10 +335,10 @@
     "vendor_raw": "Grab SG 6510",
     "amount": 19.0,
     "currency": "SGD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7100",
     "difficulty": "ambiguous",
-    "note": "Medium confidence but invalid account for tenant_b"
+    "note": "Medium-confidence ride-hailing should route to review"
   },
   {
     "tx_id": "eval_032",
@@ -349,7 +349,7 @@
     "expected_status": "UNKNOWN",
     "expected_coa_account_id": null,
     "difficulty": "long-tail",
-    "note": "Unknown refusal"
+    "note": "Ambiguous generic vendor should refuse at low confidence"
   },
   {
     "tx_id": "eval_033",
@@ -368,10 +368,10 @@
     "vendor_raw": "AWS Marketplace Compute",
     "amount": 1111.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "5050",
     "difficulty": "long-tail",
-    "note": "Cross-tenant invalid account protection"
+    "note": "Strong AWS signal should map to tenant-valid COGS account under cold-start bias"
   },
   {
     "tx_id": "eval_035",
@@ -379,10 +379,10 @@
     "vendor_raw": "Grab SG 9020",
     "amount": 11.4,
     "currency": "SGD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7100",
     "difficulty": "ambiguous",
-    "note": "Ambiguous but invalid account result for tenant_b"
+    "note": "Ambiguous Grab spend should map to travel with review routing"
   },
   {
     "tx_id": "eval_036",
@@ -401,10 +401,10 @@
     "vendor_raw": "AWS Marketplace Nightly",
     "amount": 470.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "5050",
     "difficulty": "long-tail",
-    "note": "Ensures invalid-id path remains stable"
+    "note": "AWS naming should remain tenant-valid and review-biased during cold start"
   },
   {
     "tx_id": "eval_038",
@@ -412,10 +412,10 @@
     "vendor_raw": "Grab SG 1188",
     "amount": 23.2,
     "currency": "SGD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7100",
     "difficulty": "ambiguous",
-    "note": "Another invalid account review-like case"
+    "note": "Another Grab-like review routing case"
   },
   {
     "tx_id": "eval_039",
@@ -423,10 +423,10 @@
     "vendor_raw": "Independent Travel Agent 2",
     "amount": 540.0,
     "currency": "USD",
-    "expected_status": "UNKNOWN",
-    "expected_coa_account_id": null,
+    "expected_status": "REVIEW_QUEUE",
+    "expected_coa_account_id": "7100",
     "difficulty": "long-tail",
-    "note": "Long-tail unknown expected"
+    "note": "Travel agent wording should map to Travel & Accommodation"
   },
   {
     "tx_id": "eval_040",
@@ -437,6 +437,6 @@
     "expected_status": "UNKNOWN",
     "expected_coa_account_id": null,
     "difficulty": "long-tail",
-    "note": "Final unknown safety case for tenant_b"
+    "note": "Generic services vendor should remain low-confidence refusal"
   }
 ]

@@ -12,6 +12,7 @@ class TenantConfig(BaseModel):
     api_key: str
     review_threshold: float = Field(ge=0.0, le=1.0)
     auto_post_threshold: float = Field(ge=0.0, le=1.0)
+    cold_start: bool = False
     coa_path: str
     rules_path: str
 

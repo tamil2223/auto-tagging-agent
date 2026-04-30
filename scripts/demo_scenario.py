@@ -34,7 +34,8 @@ def _format_line(result: dict[str, object], vendor_label: str) -> str:
 def run_demo_scenario() -> list[str]:
     """Runs a deterministic end-to-end demonstration and returns rendered lines."""
     run_id = uuid4().hex[:8]
-    vendor_repeat = f"grab-sg-demo-{run_id}"
+    # Use a vendor string that won't accidentally hit unrelated keyword heuristics (e.g. "demo").
+    vendor_repeat = f"grab-sg-review-{run_id}"
     lines: list[str] = []
 
     with TestClient(app) as client:
@@ -67,7 +68,7 @@ def run_demo_scenario() -> list[str]:
         res102 = client.post("/transactions/tag", json=tx102, headers=headers).json()
         lines.append(_format_line(res102, vendor_repeat))
 
-        resolve = client.post(
+        resolve_response = client.post(
             f"/review-queue/{tx102['tx_id']}/resolve",
             json={
                 "tenant_id": "tenant_a",
@@ -75,7 +76,10 @@ def run_demo_scenario() -> list[str]:
                 "final_coa_account_id": "6100",
             },
             headers=headers,
-        ).json()
+        )
+        resolve = resolve_response.json()
+        if resolve_response.status_code != 200:
+            raise RuntimeError(f"demo resolve failed: {resolve_response.status_code} {resolve}")
         lines.append(
             f"[Audit] tx={tx102['tx_id']} reviewer_override "
             f"final={resolve['result']['coa_account_id']} rule_created={resolve['rule_created']}"

@@ -19,7 +19,7 @@ def _ensure_project_root_on_path() -> None:
 
 _ensure_project_root_on_path()
 
-from app.main import app
+from app.main import app, app_config
 
 
 def _safe_percent(numerator: int, denominator: int) -> float:
@@ -29,8 +29,25 @@ def _safe_percent(numerator: int, denominator: int) -> float:
     return (numerator / denominator) * 100.0
 
 
-def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float]:
-    """Runs fixture-based evaluation and returns computed metrics."""
+def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float | int]:
+    """
+    Runs fixture-based evaluation against `/transactions/tag` and returns computed metrics.
+
+    Args:
+        tenant_id: Tenant identifier used to filter fixtures and select API key headers.
+        fixture_path: Path to JSON fixture list (each item must include `tenant_id`).
+
+    Returns:
+        Dict of scalar metrics plus integer counters (for example `auto_tag_total`) for printing.
+
+    Raises:
+        FileNotFoundError: If `fixture_path` does not exist.
+        json.JSONDecodeError: If fixture JSON is invalid.
+    """
+    tenant_cfg = app_config.tenants.get(tenant_id)
+    if tenant_cfg is None:
+        raise ValueError(f"Unknown tenant_id '{tenant_id}' in eval run.")
+
     raw_fixtures = json.loads(fixture_path.read_text(encoding="utf-8"))
     fixtures = [item for item in raw_fixtures if item.get("tenant_id") == tenant_id]
     total = len(fixtures)
@@ -44,11 +61,7 @@ def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float]:
     brier_sum = 0.0
     brier_count = 0
 
-    tenant_headers = {
-        "tenant_a": {"X-API-Key": "demo_key_tenant_a"},
-        "tenant_b": {"X-API-Key": "demo_key_tenant_b"},
-    }
-    headers = tenant_headers.get(tenant_id, {})
+    headers = {"X-API-Key": tenant_cfg.api_key}
 
     run_id = uuid4().hex[:8]
     with TestClient(app) as client:
@@ -94,9 +107,14 @@ def run_eval(tenant_id: str, fixture_path: Path) -> dict[str, float]:
                 brier_sum += (float(confidence) - is_correct) ** 2
                 brier_count += 1
 
-    metrics = {
+    auto_tag_precision = (
+        _safe_percent(auto_tag_correct, auto_tag_total) if auto_tag_total else float("nan")
+    )
+    metrics: dict[str, float | int] = {
         "total_fixtures": float(total),
-        "auto_tag_precision": _safe_percent(auto_tag_correct, auto_tag_total),
+        "auto_tag_total": auto_tag_total,
+        "auto_tag_correct": auto_tag_correct,
+        "auto_tag_precision": auto_tag_precision,
         "long_tail_unknown_rate": _safe_percent(long_tail_safe, long_tail_total),
         "review_rate": _safe_percent(review_total, total),
         "brier_score": (brier_sum / brier_count) if brier_count else 0.0,
@@ -114,7 +132,11 @@ def main() -> None:
     metrics = run_eval(args.tenant, Path(args.fixture))
     print(f"Eval results - {args.tenant}")
     print(f"  Total fixtures:          {int(metrics['total_fixtures'])}")
-    print(f"  Auto-tag precision:      {metrics['auto_tag_precision']:.1f}%")
+    auto_tag_total = int(metrics["auto_tag_total"])
+    if auto_tag_total:
+        print(f"  Auto-tag precision:      {float(metrics['auto_tag_precision']):.1f}%")
+    else:
+        print("  Auto-tag precision:      n/a (no AUTO_TAG fixtures in this run)")
     print(f"  Long-tail UNKNOWN rate:  {metrics['long_tail_unknown_rate']:.1f}%")
     print(f"  Review rate:             {metrics['review_rate']:.1f}%")
     print(f"  Brier score:             {metrics['brier_score']:.3f}")

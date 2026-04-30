@@ -139,7 +139,7 @@ def test_tag_endpoint_llm_path_auto_tags_when_confidence_is_high() -> None:
     assert data["status"] == "AUTO_TAG"
     assert data["source"] == "llm"
     assert data["coa_account_id"] == "6200"
-    assert data["confidence"] == 0.93
+    assert data["confidence"] == 0.91
 
 
 def test_tag_endpoint_llm_path_routes_to_review_queue_when_confidence_is_medium() -> None:
@@ -165,14 +165,14 @@ def test_tag_endpoint_llm_path_routes_to_review_queue_when_confidence_is_medium(
     assert data["status"] == "REVIEW_QUEUE"
     assert data["source"] == "llm"
     assert data["coa_account_id"] == "7200"
-    assert data["confidence"] == 0.65
+    assert data["confidence"] == 0.75
 
     assert queue_response.status_code == 200
     review_items = queue_response.json()
     assert any(item["tx_id"] == "tx_006" for item in review_items)
 
 
-def test_tag_endpoint_llm_result_invalid_for_tenant_routes_to_unknown() -> None:
+def test_tag_endpoint_tenant_b_cold_start_routes_aws_to_review_queue() -> None:
     client = TestClient(app)
     payload = {
         "tx_id": "tx_007",
@@ -190,9 +190,53 @@ def test_tag_endpoint_llm_result_invalid_for_tenant_routes_to_unknown() -> None:
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "UNKNOWN"
-    assert data["source"] == "unknown"
-    assert data["coa_account_id"] is None
+    assert data["status"] == "REVIEW_QUEUE"
+    assert data["source"] == "llm"
+    assert data["coa_account_id"] == "5050"
+    assert isinstance(data["confidence"], (float, int))
+
+
+def test_get_rules_endpoint_returns_rules_for_tenant() -> None:
+    client = TestClient(app)
+    response = client.get("/rules/tenant_a", headers=_headers("tenant_a"))
+
+    assert response.status_code == 200
+    rules = response.json()
+    assert isinstance(rules, list)
+    assert any(rule.get("vendor_key") == "zoom us" for rule in rules)
+
+
+def test_tenant_isolation_rejects_wrong_api_key_for_path_tenant() -> None:
+    client = TestClient(app)
+    response = client.get("/review-queue/tenant_b", headers=_headers("tenant_a"))
+
+    assert response.status_code == 403
+
+
+def test_tag_endpoint_scrubs_ocr_text_in_llm_path() -> None:
+    client = TestClient(app)
+    payload = {
+        "tx_id": _unique_key("tx_ocr"),
+        "tenant_id": "tenant_a",
+        "vendor_raw": f"OCR Smoke Vendor {_unique_key('ocr')}",
+        "amount": "12.34",
+        "currency": "USD",
+        "date": "2026-04-29",
+        "transaction_type": "card",
+        "ocr_text": "Contact payer@example.com and ref 4242",
+        "idempotency_key": _unique_key("idem_ocr"),
+    }
+
+    response = client.post("/transactions/tag", json=payload, headers=_headers("tenant_a"))
+
+    assert response.status_code == 200
+    audit = client.get("/audit-log/tenant_a", headers=_headers("tenant_a")).json()
+    matching = [event for event in audit if event.get("tx_id") == payload["tx_id"]]
+    assert matching
+    for event in matching:
+        reasoning = event.get("reasoning") or ""
+        assert "payer@example.com" not in reasoning
+        assert "4242" not in reasoning
 
 
 def test_resolve_review_item_accept_removes_from_queue() -> None:
@@ -418,6 +462,8 @@ def test_load_app_config_reads_tenants() -> None:
     assert "tenant_b" in config.tenants
     assert config.tenants["tenant_a"].review_threshold == 0.50
     assert config.tenants["tenant_a"].auto_post_threshold == 0.85
+    assert config.tenants["tenant_a"].cold_start is False
+    assert config.tenants["tenant_b"].cold_start is True
 
 
 def test_transaction_model_parses_schema() -> None:

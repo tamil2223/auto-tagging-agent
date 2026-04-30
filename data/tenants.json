@@ -15,6 +15,7 @@
       "api_key": "demo_key_tenant_b",
       "review_threshold": 0.5,
       "auto_post_threshold": 0.85,
+      "cold_start": true,
       "coa_path": "data/coa/tenant_b.json",
       "rules_path": "data/rules/tenant_b_rules.json"
     }

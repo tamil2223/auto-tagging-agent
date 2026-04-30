@@ -9,6 +9,8 @@ def test_eval_runner_returns_metrics_dictionary() -> None:
 
     assert metrics["total_fixtures"] >= 1
     assert "auto_tag_precision" in metrics
+    assert int(metrics["auto_tag_total"]) >= 0
+    assert int(metrics["auto_tag_correct"]) >= 0
     assert "long_tail_unknown_rate" in metrics
     assert "review_rate" in metrics
     assert "brier_score" in metrics

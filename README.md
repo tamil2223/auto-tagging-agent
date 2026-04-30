@@ -112,7 +112,7 @@ The agent is built around a **hybrid decision system**:
 ### 2.3 Project Structure
 
 ```
-reap-cfo-agent/
+auto-tagging-agent/
 ├── app/
 │   ├── main.py                  # FastAPI entrypoint
 │   ├── models.py                # Pydantic schemas (Transaction, CoAAccount, LLMOutput, etc.)
@@ -124,13 +124,16 @@ reap-cfo-agent/
 │   │   ├── validator.py         # Output schema + CoA membership validation
 │   │   └── router.py            # Confidence-based routing
 │   ├── store/
-│   │   ├── audit_log.py         # Append-only audit log writer
-│   │   ├── review_queue.py      # In-memory review queue
-│   │   └── rule_store.py        # Tenant vendor→CoA rules (JSON-backed)
+│   │   ├── audit_log.py         # Append-only audit log (SQLite)
+│   │   ├── idempotency_store.py # Idempotency cache (SQLite)
+│   │   ├── review_queue.py      # Review queue + idempotent resolution replay (SQLite)
+│   │   ├── confirmed_example_store.py # Few-shot confirmed examples (SQLite)
+│   │   └── rule_store.py        # Tenant vendor→CoA rules (JSON-backed + runtime JSON overlay)
 │   └── adapters/
 │       └── accounting_sync.py   # Mock accounting platform sync
 ├── data/
 │   ├── tenants.json             # Tenant configs + thresholds
+│   ├── runtime/                 # Local runtime state (gitignored): SQLite DB + promoted rules
 │   ├── coa/
 │   │   ├── tenant_a.json        # Tenant A CoA
 │   │   └── tenant_b.json        # Tenant B CoA
@@ -138,7 +141,8 @@ reap-cfo-agent/
 │       ├── tenant_a_rules.json  # Learned vendor rules for tenant A
 │       └── tenant_b_rules.json
 ├── scripts/
-│   └── demo_scenario.py         # Runnable end-to-end demo (see §10)
+│   ├── demo_scenario.py         # Runnable end-to-end demo (see §10)
+│   └── smoke_test.sh            # Optional curl smoke against a running server
 ├── tests/
 │   ├── test_rule_engine.py
 │   ├── test_validator.py
@@ -147,6 +151,7 @@ reap-cfo-agent/
 │       ├── eval_runner.py       # Offline eval harness
 │       └── fixtures/
 │           └── edge_cases.json  # Long-tail vendor eval dataset
+├── pytest.ini                   # pytest import path hardening (repo root)
 ├── requirements.txt
 └── README.md
 ```
@@ -154,6 +159,8 @@ reap-cfo-agent/
 ### 2.4 MVP API contracts (FastAPI)
 
 The MVP is intentionally API-first: the “transaction event stream” is simulated by HTTP endpoints. All endpoints are tenant-scoped via `tenant_id` in the request body or path.
+
+**Authentication (MVP)**: tenant-scoped reads and writes require the `X-API-Key` header matching the per-tenant key in `data/tenants.json`. This is intentionally simple for the take-home; production would use OAuth2/mTLS/service accounts.
 
 #### 2.4.1 Classify/tag a transaction
 
@@ -235,7 +242,7 @@ Every request is fully tenant-scoped:
 - `tenant_id` is required on every transaction event.
 - The LLM prompt is injected with that tenant's full CoA list.
 - The LLM is explicitly instructed to choose **only** from the provided account IDs.
-- The application validates the returned `coa_account_id` against the in-memory CoA list — this is the hard gate. A plausible-sounding account ID that doesn't exist in the tenant's CoA is treated as an invalid response.
+- The application validates the returned `coa_account_id` against the tenant CoA loaded at process startup (materialized as an in-memory `set` of valid IDs for fast membership checks) — this is the hard gate. A plausible-sounding account ID that doesn't exist in the tenant's CoA is treated as an invalid response.
 
 **Example CoA injection in prompt** (see §4 for full prompt):
 
@@ -252,10 +259,11 @@ You MUST return a coa_account_id from the list above. Any other value is invalid
 
 When a new tenant onboards with no historical rules:
 
-1. Raise `AUTO_POST_THRESHOLD` to 0.95 in tenant config.
-2. All LLM suggestions below 0.95 go to `REVIEW_QUEUE`.
-3. Every reviewer decision is recorded and can be promoted to a rule immediately.
-4. As the rule store grows, the auto-tag rate climbs naturally with zero risk of early silent miscoding.
+1. Mark the tenant as `cold_start: true` in `data/tenants.json` (see `tenant_b` in the seed config).
+2. The service applies an **effective** auto-post threshold of **0.95** for routing (even if `auto_post_threshold` remains at its nominal value for readability in config).
+3. All classifier suggestions below the effective auto-post threshold go to `REVIEW_QUEUE` (or `UNKNOWN` if below the review threshold), avoiding early silent auto-posts.
+4. Every reviewer decision is recorded and can be promoted to a rule immediately.
+5. As the rule store grows, the auto-tag rate climbs naturally with zero risk of early silent miscoding.
 
 This creates a deliberate trust-building ramp for each tenant.
 
@@ -538,18 +546,32 @@ A prompt change, model upgrade, or threshold adjustment must pass the eval harne
 
 ```bash
 python tests/eval/eval_runner.py --tenant tenant_a --fixture tests/eval/fixtures/edge_cases.json
+python tests/eval/eval_runner.py --tenant tenant_b --fixture tests/eval/fixtures/edge_cases.json
 ```
 
-Output:
+Example output (as of the current `edge_cases.json` harness — 20 fixtures per tenant):
 
 ```text
-Eval results — tenant_a
-  Total fixtures:          42
-  Auto-tag precision:      98.6%   ✓
-  Long-tail UNKNOWN rate:  92.3%   ✓
-  Brier score:             0.041   ✓
-  Rule coverage:           38.1%
+Eval results - tenant_a
+  Total fixtures:          20
+  Auto-tag precision:      100.0%
+  Long-tail UNKNOWN rate:  100.0%
+  Review rate:             30.0%
+  Brier score:             0.030
+  Rule coverage:           10.0%
 ```
+
+```text
+Eval results - tenant_b
+  Total fixtures:          20
+  Auto-tag precision:      n/a (no AUTO_TAG fixtures in this run)
+  Long-tail UNKNOWN rate:  100.0%
+  Review rate:             65.0%
+  Brier score:             0.040
+  Rule coverage:           0.0%
+```
+
+Note: `tenant_b` is configured with `cold_start: true`, which raises the effective auto-post threshold; the fixture set is intentionally biased toward **REVIEW_QUEUE** / **UNKNOWN** rather than **AUTO_TAG**.
 
 ---
 
@@ -563,7 +585,7 @@ Eval results — tenant_a
 | Fallback LLM | Anthropic Claude (`CLAUDE_API_KEY`) | Invoked automatically if Gemini errors or times out; strong JSON compliance and instruction-following |
 | Second Fallback LLM | OpenAI GPT-4o (`OPENAI_API_KEY`) | Final safety net if both Gemini and Claude are unavailable; ensures the pipeline never hard-fails on a single provider outage |
 | LLM Abstraction | LiteLLM | Standardizes API calls across all three providers using the OpenAI request format; the fallback chain is ~5 lines of code rather than three separate SDKs with divergent timeout and error handling |
-| Storage (MVP) | JSON files + in-memory dict | Zero infrastructure overhead; easy to inspect and debug during prototype phase |
+| Storage (MVP) | SQLite (`data/runtime/state.db`) + JSON seed files | Durable-enough local persistence for audit/idempotency/review/few-shot examples without standing up Postgres |
 | Storage (production) | Postgres + Redis + append-only audit table | See §9 |
 | Vendor normalization | Regex + `str.lower()` + whitespace collapse | Deterministic, fast, no external dependency |
 
@@ -609,7 +631,8 @@ Eval results — tenant_a
 ### Prerequisites
 
 - Python 3.10+
-- **At least one** of the following API keys in your `.env` file. The system dynamically builds the fallback chain based on whichever keys are present — a reviewer only needs one key to run the full demo:
+- **No LLM keys are required** to run tests, the demo script, or the offline eval harness: when `LLM_ENABLE_LIVE_CALLS=false` (default), the service uses a deterministic classifier path for stable CI and local development.
+- **Optional live provider calls**: set `LLM_ENABLE_LIVE_CALLS=true` and provide one or more provider keys. The system dynamically builds the fallback chain based on whichever keys are present:
   - `GOOGLE_API_KEY` — primary LLM (Gemini) + Google Cloud services (Document AI / Vision OCR)
   - `CLAUDE_API_KEY` — fallback LLM (Claude)
   - `OPENAI_API_KEY` — fallback LLM (GPT-4o)
@@ -618,18 +641,23 @@ Eval results — tenant_a
 ### Setup
 
 ```bash
-cd reap-cfo-agent
-python -m venv venv
-source venv/bin/activate
+cd auto-tagging-agent
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env       # add your GOOGLE_API_KEY, CLAUDE_API_KEY, OPENAI_API_KEY
+cp .env.example .env       # optional: add provider keys + LLM_ENABLE_LIVE_CALLS=true for live calls
 ```
 
 `.env.example`:
 
 ```env
-# At least ONE key is required. The fallback chain is built dynamically
-# from whichever keys are present. Recommended order: Gemini → Claude → OpenAI.
+# Live provider calls are opt-in for deterministic local dev/tests.
+# Set to true when you want real provider chaining.
+LLM_ENABLE_LIVE_CALLS=false
+
+# Optional provider keys (used only when LLM_ENABLE_LIVE_CALLS=true).
+# The fallback chain is built dynamically from whichever keys are present.
+# Recommended order: Gemini → Claude → OpenAI.
 
 # Primary LLM + Google Cloud services (Document AI, Vision OCR)
 # GOOGLE_API_KEY=your_google_api_key_here
@@ -648,6 +676,25 @@ uvicorn app.main:app --reload
 ```
 
 API docs available at `http://localhost:8000/docs`.
+
+### Run tests
+
+```bash
+pytest
+```
+
+If your environment does not pick up `pytest.ini` for some reason, this also works:
+
+```bash
+python -m pytest
+```
+
+### Optional HTTP smoke test (requires a running server)
+
+```bash
+uvicorn app.main:app --reload
+bash scripts/smoke_test.sh
+```
 
 ### Demo scenario (recommended starting point)
 
@@ -695,7 +742,7 @@ This output demonstrates the full safety story: rule-based auto-tag, LLM with me
 - **Accounting platform sync**: Represented by a mock adapter that logs the payload. Real integration (Xero, QuickBooks, NetSuite) is an adapter swap.
 - **Vendor rules are keyed by normalized vendor string**: Lowercased, whitespace collapsed, punctuation stripped. E.g., `"AWS Marketplace, Inc."` → `"aws marketplace inc"`. Fuzzy matching is a next-step improvement.
 - **Few-shot examples are sampled from confirmed tenant history**: For the MVP, up to 5 examples are selected randomly. In production, retrieval-based selection (most similar vendor category) is better.
-- **Storage is local JSON files**: Sufficient for prototype demonstration. Production storage choices are documented in §9.
+- **Storage is local JSON seed files + SQLite runtime state**: sufficient for a take-home MVP demo; production storage choices are documented in §9.
 - **Single primary LLM call per transaction**: fallback providers are only invoked if the primary errors or times out. For the MVP's narrow scope (CoA tagging only), a single well-structured prompt is sufficient; in the worst case (all prior providers fail) up to 3 calls are made, each with the same prompt and schema.
 - **Rule writes are idempotent on `(tenant_id, vendor_key)`**: if two transactions for the same new vendor arrive simultaneously and both trigger reviewer corrections concurrently, the second write is a no-op (last-write-wins on an identical key). This prevents duplicate rule entries and makes the rule store safe under concurrent correction.
 - **No PII in demo data**: Demo fixtures use synthetic data. PII scrubbing is listed as a production must-have in §9.
